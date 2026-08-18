@@ -302,8 +302,7 @@ chmod +x /mmc/root/payloads/user/capture/pineapol/payload.sh
 
 Copy the complete directory, including `bin/`; copying only `payload.sh` will
 fail backend validation. The installed directory and loot namespace are named
-`pineapol`; the payload title remains **WPA-Enterprise Credential Harvester**
-in the Pager UI.
+`pineapol`; the payload appears as **pinEAPol** in the Pager UI.
 
 The script checks its core command dependencies and offers to install missing
 ones with `opkg`. It never installs over the system hostapd/wpad service.

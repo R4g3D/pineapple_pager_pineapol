@@ -1,5 +1,5 @@
 #!/bin/bash
-# Title: WPA-Enterprise Credential Harvester
+# Title: pinEAPol
 # Author: R4g3D
 # Description: Pager-native hostapd-mana orchestrator for authorized WPA-Enterprise EAP credential capture
 # Version: 3.5

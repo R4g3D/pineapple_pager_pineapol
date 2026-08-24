@@ -2,6 +2,3 @@
 *.swp
 *.tmp
 *~
-
-# Local Kali integration-test transcript; may contain real test evidence.
-payloads/user/capture/pineapol/tests/output.txt

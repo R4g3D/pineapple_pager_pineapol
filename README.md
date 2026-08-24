@@ -15,7 +15,7 @@ persistent evidence, and a verified hostapd-mana backend.
 - **Type:** User payload
 - **Category:** Capture
 - **Author:** R4g3D
-- **Version:** 3.6
+- **Version:** 3.7
 
 ## What is pinEAPol?
 
@@ -64,10 +64,10 @@ arbitrary password will authenticate successfully.
 
 - Persistent per-session logs, captures, parsed results, configuration, and
   certificate fingerprints; pinEAPol does not use `/tmp` for its own data.
-- Live detection of identities, GTC/PAP values, and complete MANA MSCHAPv2
-  Hashcat events without repeatedly parsing the entire debug log.
-- Atomic result publication, per-station EAP event timelines, raw
-  `hostapd -ddd -K` logging, and optional EAPOL PCAP retention.
+- Redacted live EAP-negotiation status, including client association, method
+  transitions, client NAKs, authentication outcomes, and evidence counters.
+- Atomic result publication, raw `hostapd -ddd -K` logging, and optional EAPOL
+  PCAP retention.
 - Crash-safe cleanup, an exclusive-run lock, and ownership validation that
   prevents pinEAPol from terminating the Pager's system hostapd.
 
@@ -84,25 +84,22 @@ The selected profile controls which methods the test AP offers. The client still
 chooses whether to connect, whether to trust the presented certificate, and
 which compatible method to use.
 
-| Profile | Expected assessment evidence | Plaintext password expected? |
+| Outer method | Compatible focused choices | Expected assessment evidence |
 |---|---|---|
-| Broad / automatic | Method negotiation plus the strongest evidence emitted by any outer or inner method enabled in the bundled MANA build | Depends on the selected inner method |
-| PEAP + MSCHAPv2 | Identity and MSCHAPv2 challenge-response in Hashcat mode 5500 form | No |
-| PEAP + GTC | Identity and a possible GTC response | Possible |
-| TTLS + PAP | Identity and a possible PAP username/password record | Possible |
-| TTLS + CHAP | Identity and a legacy CHAP challenge-response | No |
-| TTLS + MSCHAPv1 | Identity and a legacy MSCHAPv1 challenge-response | No |
-| TTLS + MSCHAPv2 | Identity and MSCHAPv2 challenge-response | No |
-| EAP-TLS | Client-certificate negotiation and TLS diagnostics | No password is exchanged |
-| EAP-TLS + accept client certificate | Client-certificate negotiation while accepting the presented certificate | No password is exchanged |
-| FAST + MSCHAPv2/GTC | MSCHAPv2 material or a possible GTC response | Method-dependent |
-| EAP-MD5 | Legacy challenge-response material | No |
+| Broad / automatic | All supported outer and inner WPE methods | The strongest identity, plaintext, challenge-response, and TLS evidence the client supplies |
+| PEAP | MSCHAPv2, GTC, MD5 | Hashcat 5500 response, possible plaintext, or MD5 material |
+| TTLS | EAP-MD5, EAP-GTC, EAP-MSCHAPv2, MSCHAPv2, MSCHAPv1, PAP, CHAP | Hashcat 5500 response, possible plaintext, or legacy CHAP material |
+| FAST | MSCHAPv2, GTC | Method-dependent MANA evidence |
+| EAP-TLS | Verify or accept a presented client certificate | TLS/certificate diagnostics; no password exchange |
+| Direct EAP | MD5, MSCHAPv2, GTC | Legacy challenge-response, Hashcat 5500 response, or possible plaintext |
 
 pinEAPol enables MANA WPE only. Karma probe responses and forced EAP success
 remain disabled. Accept-any-client-certificate behavior is available only in the
 explicit **EAP-TLS [accept client cert]** profile; it is not part of the broad
 profile. A client that correctly rejects the assessment certificate may provide
-only limited negotiation evidence.
+only limited negotiation evidence. If a MANA method nevertheless completes EAP,
+pinEAPol immediately removes that station from its payload-owned AP interface;
+the payload is not intended to provide client network access.
 
 ## Requirements and compatibility
 
@@ -118,6 +115,9 @@ Required on the Pager:
 - `iw` and `ifconfig`.
 - `iwinfo` for automatic enterprise-network discovery. Manual SSID/channel
   entry remains available when discovery returns no results.
+- `hostapd_cli`, supplied by `hostapd-utils`, so pinEAPol can deauthenticate a
+  station through the payload-owned hostapd control socket after evidence is
+  recorded.
 - A radio that advertises AP mode. pinEAPol prefers `phy1` and falls back to
   `phy0`.
 - The complete payload directory, including
@@ -161,9 +161,9 @@ service.
 6. Leave client reconnection disabled unless the engagement explicitly permits
    a deauthentication burst against the selected BSSID.
 7. Review the complete configuration and choose **Deploy**.
-8. Watch the live identity and capture counters. Press a Pager button when you
-   are ready to stop and harvest the session.
-9. Retrieve the report and supporting evidence from
+8. Watch the redacted live negotiation state and evidence counters. Press a
+   Pager button when you are ready to stop and harvest the session.
+9. Retrieve the captured hashes, plaintext credentials, and supporting logs from
    `/root/loot/pineapol/current/`.
 
 ## Pager walkthrough
@@ -287,11 +287,14 @@ prepares its virtual AP interface, and starts the bundled hostapd-mana backend.
 
 ### 7. Live capture
 
-During deployment, the Pager reports newly observed identities, negotiated
-methods, complete MSCHAPv2 responses, possible GTC/PAP plaintext, authentication
-outcomes, and periodic counters. Capture events trigger Pager feedback. The raw
-debug log remains available even when a record cannot be promoted into a parsed
-result.
+During deployment, the Pager reports 802.11 association, EAP start, proposed
+and negotiated EAP methods, client NAKs, authentication outcomes, and periodic
+evidence counters in hostapd log order. Identities, passwords, and hash material are never shown on the Pager
+display. A successful EAP-TLS exchange explicitly reports that no
+password-derived material is expected; other successful exchanges wait briefly
+for buffered output before reporting that raw session logs were retained. Each normalized artifact is
+published atomically as it appears; the raw debug log remains available even
+when a record cannot be promoted into a parsed result.
 
 <p align="center">
   <img src="screenshots/25-starting-hostapd-screen.png" width="480" alt="Starting hostapd-mana">
@@ -310,9 +313,9 @@ result.
 
 Press a Pager button to request an orderly stop. pinEAPol flushes hostapd and
 tcpdump, removes only its managed virtual interface, performs the final parse,
-and displays counts for identities, plaintext records, and MSCHAPv2 captures.
-When nothing was parsed, the completion dialog still points to the retained raw
-session logs.
+and displays counts for identities, plaintext records, EAP challenge responses,
+WPA hashes, and TLS evidence. The detached cleanup watchdog performs the same evidence
+publication if Pager UI termination bypasses this orderly path.
 
 <p align="center">
   <img src="screenshots/28-shell-loot-hash.png" width="700" alt="Captured MSCHAPv2 record in persistent session loot">
@@ -372,10 +375,10 @@ binary checksum, and generated configuration before signaling hostapd-mana.
 Next-run recovery remains as a second safeguard after power loss or a forced
 device shutdown.
 
-An orderly stop flushes hostapd and tcpdump, performs the comprehensive final
-parse, and creates the report. If power loss or forced termination prevents that
-harvest step, the raw hostapd and MANA logs remain the authoritative evidence,
-but derived result files may reflect only the last completed live update.
+An orderly stop flushes hostapd and tcpdump, then performs the comprehensive
+credential parse. If power loss or forced termination prevents that harvest
+step, the raw hostapd and MANA logs remain the authoritative evidence, while
+the watchdog performs the same credential-result publication after teardown.
 
 If hostapd reports a busy radio, the session's `logs/radio-state.log` records
 `iw dev`, hostapd processes, and pinEAPol's runtime ownership state.
@@ -430,28 +433,28 @@ every session that reaches certificate setup.
 
 ## EAP profiles
 
-The Pager presents these choices in a scrollable list, with the previously
-selected profile highlighted:
+The Pager first presents the outer method, then presents only the compatible
+inner methods (where the outer method has one). Every dependent list includes
+**Back**, which returns to the outer-method list without changing the selected
+profile. The previously selected profile is highlighted:
 
-| UI choice | Outer method | Inner method or expected evidence |
+| Outer UI choice | Inner UI choices | Generated EAP user methods |
 |---|---|---|
-| Broad / automatic | PEAP, TTLS, TLS, FAST, MD5 | MD5, MSCHAPv2, GTC, TTLS-PAP, TTLS-CHAP, TTLS-MSCHAP, or TTLS-MSCHAPv2 |
-| PEAP + MSCHAPv2 | PEAPv0 | MSCHAPv2 Hashcat record |
-| PEAP + GTC | PEAPv0 | Potential cleartext GTC response |
-| TTLS + PAP | TTLS | Potential cleartext PAP credentials |
-| TTLS + CHAP | TTLS | Legacy CHAP challenge-response |
-| TTLS + MSCHAPv1 | TTLS | Legacy MSCHAPv1 challenge-response |
-| TTLS + MSCHAPv2 | TTLS | MSCHAPv2 Hashcat record |
-| EAP-TLS | TLS | Client-certificate negotiation; no password |
-| EAP-TLS + accept client certificate | TLS | Accepts the presented client certificate; no password |
-| FAST + MSCHAPv2/GTC | FAST | MSCHAPv2 record or potential GTC cleartext |
-| EAP-MD5 | MD5 | Legacy challenge-response material |
+| Broad / automatic | — | PEAP, TTLS, TLS, FAST, MD5, MSCHAPv2, GTC; plus every WPE-supported inner method |
+| PEAP | MSCHAPv2, GTC, MD5 | PEAPv0 plus the selected inner EAP method |
+| TTLS | EAP-MD5, EAP-GTC, EAP-MSCHAPv2, MSCHAPv2, MSCHAPv1, PAP, CHAP | TTLS plus the selected compatible inner method |
+| FAST | MSCHAPv2, GTC | FAST plus the selected inner EAP method |
+| EAP-TLS | Verify client certificate, accept presented client certificate | TLS, optionally `mana_eaptls=1` |
+| EAP-MD5 | — | MD5 |
+| EAP-MSCHAPv2 | — | MSCHAPv2 |
+| EAP-GTC | — | GTC |
 
-Broad mode contains every EAP server outer method compiled into the bundled MANA
-build—PEAP, TTLS, TLS, FAST, and MD5—and every applicable inner method: MD5,
-MSCHAPv2, GTC, TTLS-PAP, TTLS-CHAP, TTLS-MSCHAP, and TTLS-MSCHAPv2. It does not
-include invalid phase-two outer-method entries. Focused profiles are useful when
-broad negotiation reveals what a client supports.
+Broad mode contains every credential-bearing outer method implemented by the
+bundled MANA WPE build—PEAP, TTLS, TLS, FAST, MD5, MSCHAPv2, and GTC—and every
+applicable inner method: MD5, MSCHAPv2, GTC, TTLS-PAP, TTLS-CHAP, TTLS-MSCHAP,
+and TTLS-MSCHAPv2. It does not include unsupported EAP extensions merely because
+the underlying hostapd may compile them. Focused profiles are useful when broad
+negotiation reveals what a client supports.
 
 All tunneled profiles use MANA WPE's synthetic `"t"` phase-2 identity. MANA
 rewrites the client's inner identity to this value for its EAP-user lookup before
@@ -483,10 +486,12 @@ successfully.
    no target BSSID is known.
 4. Review the complete setup before certificate generation or radio changes.
 5. Deploy `wlan_pineapol`, start hostapd-mana, and optionally start tcpdump.
-6. Monitor new log data once per second. Each distinct MANA MSCHAPv2 record is
-   published atomically and triggers the capture notification.
-7. Press a Pager button to stop, flush processes, remove `wlan_pineapol`, run the
-   final parser, and generate the report.
+6. Monitor new log data approximately twice per second. MANA MSCHAP-family, MD5/CHAP, and
+   GTC/PAP records are published atomically as they appear. TLS/certificate
+   diagnostics remain in raw logs. The watchdog repeats credential parsing after
+   abnormal UI exit.
+7. Press a Pager button to stop, flush processes, remove `wlan_pineapol`, and
+   run the final credential parser.
 
 ## Session output
 
@@ -512,48 +517,57 @@ sessions/<timestamp>_<ssid>/
 ├── captures/
 │   └── eap_capture.pcap             # when tcpdump is invoked
 ├── results/
-│   ├── identities.txt
-│   ├── cleartext_creds.tsv
-│   ├── eap_sessions.tsv
-│   ├── mana_cleartext_creds.tsv
-│   ├── mana_mschapv2.tsv
-│   ├── mana_chap.tsv
-│   ├── mschapv2_raw.tsv
+│   ├── cleartext.txt
+│   ├── hashcat_22000.txt
 │   ├── hashcat_5500.txt
-│   └── report.txt
+│   └── hashcat_4800.txt
 └── work/
     ├── live-hostapd.delta           # rolling live-parser input
     └── certificate-generation/      # when certificate generation occurs
 ```
 
-`duration.txt`, the comprehensive TSV files, and `report.txt` are finalized by
-an orderly harvest. Conditional or empty files may be absent when their optional
-producer is unavailable or when a run ends unexpectedly.
+Only crack-ready hashes and plaintext credentials are published in `results/`.
+The detached cleanup watchdog publishes those same files after abnormal UI exit,
+once it has stopped the managed processes. Identities, EAP timelines,
+TLS/certificate diagnostics, and MANA's tagged source records remain in the raw
+session logs. Conditional or empty credential files are absent.
 
-`eap_sessions.tsv` associates observed events with a station MAC and session
-number where hostapd supplies enough context. Lines without a resolvable station
-are retained as `unknown`; pinEAPol does not invent an association.
+`cleartext.txt` is deliberately headerless and uses one readable record per
+line: `[METHOD] username:password`. The Hashcat files likewise contain only the
+native input records accepted by their respective modes.
 
 Plaintext output is limited to values emitted by MANA's PAP/GTC callback or
 appearing in a verified GTC/PAP debug context. A generic `Response=` debug value
 is not automatically treated as a password.
 
-MANA writes MSCHAPv2 records directly in Hashcat mode 5500 form. Live monitoring
-consumes MANA's immediate hostapd event stream, so a distinct response should be
-reported on the next approximately one-second polling cycle. It does not reparse
-the complete, growing debug log.
+MANA writes MSCHAP-family records directly in Hashcat mode 5500 form. MD5 and
+standard CHAP material is written to `hashcat_4800.txt` in Hashcat mode 4800
+input form. If a completed WPA-EAP connection produces a MANA WPA handshake,
+its native record is retained in `hashcat_22000.txt`. Immediate plaintext
+GTC/PAP output is also consumed live. Live monitoring consumes MANA's immediate
+hostapd event stream, so a distinct record should be reported on the next
+approximately half-second polling cycle.
 
-During final harvest, the dedicated credential file and immediate hostapd MANA
-events are combined and deduplicated. `mana_mschapv2.tsv` splits those records
-into username, NT response, and effective challenge. The debug parser preserves
-authenticator challenge, peer challenge, NT response, and the locally derived
-effective challenge only as a fallback when MANA did not provide that response.
-Each published result file is replaced atomically.
+During normal harvest and watchdog cleanup, the dedicated credential file and
+immediate hostapd MANA events are combined and deduplicated. Each published
+result file is replaced atomically.
 
 To test an MSCHAPv2 capture against an authorized wordlist:
 
 ```sh
 hashcat -m 5500 /path/to/session/results/hashcat_5500.txt wordlist.txt
+```
+
+To test captured EAP-MD5 or TTLS-CHAP material:
+
+```sh
+hashcat -m 4800 /path/to/session/results/hashcat_4800.txt wordlist.txt
+```
+
+To test an emitted WPA handshake:
+
+```sh
+hashcat -m 22000 /path/to/session/results/hashcat_22000.txt wordlist.txt
 ```
 
 ## Verification
@@ -571,6 +585,37 @@ grep -n '/tmp/' payload.sh
 The two `grep` checks should produce no output. `tests/test_parsers.sh` is a
 repository-side regression test and is not required on the Pager.
 
+### Kali EAP client matrix
+
+For an authorised end-to-end lab check, use a dedicated Kali wireless adapter
+to exercise the capture-relevant client methods against the Pager AP. The
+matrix creates per-attempt `wpa_supplicant` configurations in a protected
+temporary directory, streams the supplicant log by default, stops the test
+client after its first EAP terminal event, and removes those files when it
+finishes. It does not modify the Pager. A successful EAP exchange may complete
+the WPA four-way handshake before the Kali client can be terminated; pinEAPol
+then removes that station from its AP interface.
+
+```sh
+cd payloads/user/capture/pineapol
+sudo ./tests/kali_eap_client_matrix.sh --run \
+  --iface wlan1 --ssid "Your test SSID" --identity test --password test
+```
+
+By default it follows the broad EAP offer order: direct EAP-MD5, EAP-GTC, and
+EAP-MSCHAPv2; credential-bearing TTLS variants; then PEAP and FAST variants.
+Restrict a run with `--profiles ttls-pap,ttls-gtc`, adjust the wait with
+`--attempt-seconds`, and use `--ca-cert /path/to/ca.pem` when certificate
+verification is wanted. Run `--help` for the full options list. The interface
+must be dedicated and not managed by another `wpa_supplicant` instance.
+
+The broad Pager profile is an integration target, not a way to force a chosen
+tunneled inner method. The Kali script prints the inner method that
+`wpa_supplicant` reports and warns when it differs from the requested test
+name. For exact coverage, select the matching focused EAP profile on the Pager
+(for example `PEAP → MD5`) and run its corresponding single Kali profile (for
+example `--profiles peap-md5`).
+
 Pager-side checks during a session:
 
 ```sh
@@ -580,6 +625,8 @@ cat /root/loot/pineapol/current/config/hostapd.conf
 tail -f /root/loot/pineapol/current/logs/hostapd.log
 tail -f /root/loot/pineapol/current/logs/mana-credentials.log
 cat /root/loot/pineapol/current/results/hashcat_5500.txt
+cat /root/loot/pineapol/current/results/hashcat_4800.txt
+cat /root/loot/pineapol/current/results/hashcat_22000.txt
 
 grep -Ein \
 'PEAP|TTLS|FAST|TLS|MSCHAP|GTC|PAP|Identity|Phase 2|method|SUCCESS|FAIL|NAK' \

